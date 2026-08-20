@@ -74,3 +74,39 @@
 - 是否进入 REPORT.md：是
 - 遗留问题：为αβ域设计谐波字典，零序1字节标记可与重复帧结合
 
+---
+## [2026-08-20] 专题：文件化 I/O 实现 data/ -> out/ 目录结构与真实波形验证 (v0.4)
+- 类型：用户专题 / 实验专题
+- 目标与假设：
+  - 按用户要求实现输入输出目录：data/ 现场 CSV/COMTRADE，out/compressed/ 二进制，out/reconstructed/ 复原 CSV
+  - 验证真实波形文件 data/wave1.csv (100233行, 10kHz, 10秒) 的压缩与复原
+- 方法 / 数据 / 参数：
+  - 扩展 MAX_POINTS_PER_CYCLE 128->1024，FFT 增加非2幂 DFT fallback (O(N^2)) 支持 200点/周期@10kHz
+  - 库模式守卫：compress_data.c 添加 #ifndef COMPRESSOR_LIB 包裹 main，file_tool.c 定义宏后 #include 实现代码复用，避免重复
+  - 文件工具 file_tool.c (编译为 nilm_tool)：
+    - ensure_dir 自动创建目录
+    - estimate_sample_rate_from_csv 从时间戳差估算采样率，异常回退 10000Hz
+    - read_csv_wave 动态解析 header，支持 timestamp,UA,IA,UB,IB,UC,IC 任意列顺序，容错空列
+    - 二进制格式：magic "NILM" 4B + version u32 + sampleRate i32 + ppc i32 + numFrames i32 + flags i32 + 每帧 6x(u32 size + data)，支持 0xFF 重复标记
+    - write_compressed_bin / write_reconstructed_csv 使用独立编解码器历史状态，保留原始 timestamp 字符串
+    - CLI：--mode 0|1|2, --zero-opt 0|1, --input <file>，默认处理 data/*.csv
+  - 数据：data/wave1.csv 100233行，timestamp 2020/09/21 10:03:18.9996-10:03:29.0228，UA~300V IA~1A，采样率估算 10000Hz，ppc 200，501周期
+  - 测试：make all -> compress_data + nilm_tool，./nilm_tool --mode 1 --input data/wave1.csv
+- 结果 / 结论：
+  - 读取成功：100233行，估算采样率 10000Hz，pointsPerCycle 200
+  - 压缩：原始 4811184 字节 (100233*6*8)，压缩 48606 字节 (含头)，压缩比 98.98:1
+    - ULTRA 45204B 106.43:1 相似度 99.99%
+    - BALANCED 48606B 98.98:1 99.99%
+    - HIGH 56829B 84.66:1 99.87%
+  - 复原：out/reconstructed/wave1_reconstructed.csv 7.8MB，保留原始 timestamp，平均相似度 99.9918%
+  - 二进制：out/compressed/wave1.bin 48KB，Header NILM可识别，od 检验 magic 494e4d4c
+  - 批量处理：process_data_directory 自动处理 data/ 下所有 CSV，符合用户目录结构要求
+- 是否进入 REPORT.md：是，作为 v0.4 稳定版本，目录结构与真实文件验证
+- 遗留问题：
+  - COMTRADE 支持：当前仅 CSV，.cfg/.dat 解析待实现，可先转换为 CSV
+  - 200点非2幂 DFT 效率 O(N^2)，可优化为混合基 FFT 或预先补零到256
+  - 二次熵编码与 Python 绑定
+  - 大文件 Git 管理：data/wave1.csv 7.2M 已提交，需考虑外部存储约定
+
+
+

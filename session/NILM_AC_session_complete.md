@@ -29,3 +29,26 @@
   - 真实COMTRADE数据验证非平衡/暂态
 - 相关文件/分支：compress/compress_data.c (v0.3)、STATUS.md、README.md、REPORT.md、REPORT_TEST.md、setup.sh / arena/01a01ce5-nilm-tool
 
+## [2026-08-20] 会话纪要 - 实现 data/ out/ 目录结构与真实波形文件支持 (v0.4)
+- 目标：按用户要求实现输入输出目录结构 data/现场CSV/COMTRADE，out/compressed/二进制，out/reconstructed/复原CSV；支持真实文件 data/wave1.csv 10kHz批量处理
+- 完成项：
+  - 拉取最新代码：远程 8fa463d 已包含 data/wave1.csv (100233行, 7.2M, 10kHz) 与 v0.3 核心
+  - 扩展压缩器：MAX_POINTS 128->1024，FFT 支持非2幂 DFT fallback (朴素DFT)，解决200点/周期@10kHz问题
+  - 库模式：compress_data.c 添加 #ifndef COMPRESSOR_LIB 守卫，file_tool.c 定义宏后 #include 复用代码，避免重复
+  - 文件工具 file_tool.c -> nilm_tool：ensure_dir, estimate_sample_rate_from_csv (时间戳差), read_csv_wave 动态解析header, 二进制格式 NILM magic + version + sampleRate + ppc + numFrames + flags + 每帧6x(size+data) 支持0xFF重复，write_compressed_bin/write_reconstructed_csv 使用独立历史，保留timestamp
+  - Makefile 更新：同时构建 compress_data + nilm_tool，增加 dirs/run-tool/test-file
+  - 实测：data/wave1.csv 100233行 10kHz 200点/周期 501周期，原始4.8MB，压缩 48KB 98.98:1 相似度99.99%；ULTRA 106:1, HIGH 84:1，生成 out/compressed/wave1.bin 和 out/reconstructed/wave1_reconstructed.csv
+  - 文档：README 更新目录结构与二进制格式说明，REPORT.md 增加v0.4，REPORT_TEST.md 追加专题，STATUS.md 更新
+  - .gitignore 增加 out/
+- 关键决策：
+  - 采用 #include 复用方式而非拆分为多文件，符合 BOOTSTRAP 文件治理且快速实现
+  - 二进制格式设计简单 Header + 帧，兼容重复标记，便于流式与MQTT/CoAP
+  - 保留timestamp字符串确保时间轴一致，便于NILM对齐
+  - 采样率估算从时间戳差，异常回退10000Hz
+  - 批量处理 data/*.csv，符合生产流程
+- 未决问题：
+  - COMTRADE .cfg/.dat 解析待实现
+  - 200点DFT O(N^2)效率可优化为混合基FFT或补零256
+  - 二次熵编码与Python绑定
+- 相关文件/分支：compress/compress_data.c (v0.4), file_tool.c, Makefile, data/wave1.csv, out/compressed/, out/reconstructed/ / arena/01a01ce5-nilm-tool
+

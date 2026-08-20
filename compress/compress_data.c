@@ -97,7 +97,30 @@ static DictPattern g_dictPatterns[] = {
 
 static double clamp_d(double v, double min, double max){ return v<min?min:(v>max?max:v); }
 
+static bool is_power_of_two(int n){
+    return (n>0) && ((n & (n-1))==0);
+}
+
 static void fft(Complex* a, int n, bool invert){
+    // 若非2的幂，使用朴素DFT O(N^2) 支持任意点数 (如 200点@10kHz)
+    if(!is_power_of_two(n)){
+        Complex* out=(Complex*)malloc(n*sizeof(Complex));
+        if(!out) return;
+        for(int k=0;k<n;k++){
+            double real=0, imag=0;
+            for(int t=0;t<n;t++){
+                double angle=2.0*PI*k*t/n * (invert ? 1.0 : -1.0);
+                double c=cos(angle), s=sin(angle);
+                real += a[t].real * c - a[t].imag * s;
+                imag += a[t].real * s + a[t].imag * c;
+            }
+            if(invert){ real/=n; imag/=n; }
+            out[k].real=real; out[k].imag=imag;
+        }
+        memcpy(a,out,n*sizeof(Complex));
+        free(out);
+        return;
+    }
     int i,j,len;
     double ang;
     Complex w,wlen,u,v,temp;
@@ -208,10 +231,12 @@ static int extract_harmonics(const Complex* freq,int n,int K,double deadZone,int
     return count;
 }
 
+#define MAX_POINTS_PER_CYCLE 1024
+
 typedef struct{
     CompressionConfig config;
     int N;
-    Complex prevFreq[6][128];
+    Complex prevFreq[6][MAX_POINTS_PER_CYCLE];
     bool hasPrev[6];
     double prevMean[6];
     double prevScale[6];
@@ -224,8 +249,9 @@ typedef struct{
 static void compressor_init(HybridCompressor* comp,const CompressionConfig* config){
     comp->config=*config;
     comp->N=config->pointsPerCycle;
+    if(comp->N > MAX_POINTS_PER_CYCLE) comp->N = MAX_POINTS_PER_CYCLE;
     comp->totalFrames=0; comp->dictUsed=0; comp->diffUsed=0; comp->avgHarmonics=0;
-    for(int i=0;i<6;i++){ memset(comp->prevFreq[i],0,sizeof(Complex)*128); comp->hasPrev[i]=false; comp->prevMean[i]=0; comp->prevScale[i]=1.0; }
+    for(int i=0;i<6;i++){ memset(comp->prevFreq[i],0,sizeof(Complex)*MAX_POINTS_PER_CYCLE); comp->hasPrev[i]=false; comp->prevMean[i]=0; comp->prevScale[i]=1.0; }
 }
 
 /* ---------- 压缩单通道 v0.3 with repeat and dict ---------- */
@@ -670,6 +696,7 @@ static void test_multiframe(int sampleRate,int n,int numCycles){
     free(Va); free(Vb); free(Vc); free(Ia); free(Ib); free(Ic);
 }
 
+#ifndef COMPRESSOR_LIB
 int main(){
     int sampleRate=6400; int n=sampleRate/50;
     const char* modeNames[]={"极致压缩","平衡模式","高质量"};
@@ -729,3 +756,4 @@ int main(){
     printf("============================================================\n");
     return 0;
 }
+#endif // COMPRESSOR_LIB
