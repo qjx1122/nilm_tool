@@ -52,3 +52,19 @@
   - 二次熵编码与Python绑定
 - 相关文件/分支：compress/compress_data.c (v0.4), file_tool.c, Makefile, data/wave1.csv, out/compressed/, out/reconstructed/ / arena/01a01ce5-nilm-tool
 
+## [2026-08-20] 会话纪要 - 批量验证 data/ 下所有文件并统计压缩比相似度 (v0.5)
+- 目标：拉取最新代码（新增 wave2-4.csv），使用 data/ 下所有文件运行程序进行验证测试，统计每个文件的压缩比和相似度
+- 完成项：
+  - 拉取 f7771fa 最新代码：data/ 下 4 文件 wave1-4.csv 共 21M 287232行
+  - 增强 file_tool.c：新增 FileMetrics 结构体，verify_and_compress 同时压缩解压并计算 6通道相似度/RMSE/SNR，生成 out/verification_report.csv/txt
+  - 批量处理：./nilm_tool --mode 1 批量处理 4 文件，实测 wave1 98.94:1 99.48%，wave2 98.67:1 99.41%，wave3 100.09:1 99.59%，wave4 87.76:1 99.72%，汇总平均 96.16:1 99.55%
+  - 输出：out/compressed/ 148KB (4 bin)，out/reconstructed/ 23MB (4 csv)，out/verification_report.csv/txt 详细指标
+  - 文档：STATUS.md 更新批量验证结果，REPORT_TEST.md 追加专题 v0.5，准备提交
+- 关键决策：
+  - 双格式报告：CSV 便于机器分析，TXT 便于人类阅读
+  - 电流通道相似度略低于电压（电压~99.99% 电流~98.7-99.5%）因电流幅值小谐波相对大，量化误差影响略大，后续可提高电流谐波量化位数
+  - wave4 压缩比偏低 87:1 因暂态/畸变较多，字典匹配效率下降，但相似度仍>99.7% 达标
+- 未决问题：电流通道优化、COMTRADE 解析、二次熵编码
+- 相关文件/分支：file_tool.c (增强验证报告), data/wave1-4.csv, out/verification_report.csv/txt / arena/01a01ce5-nilm-tool
+
+

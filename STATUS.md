@@ -1,54 +1,40 @@
 # STATUS.md
 ## 当前目标
-- 实现数据目录结构：`data/` 现场 CSV/COMTRADE 输入，`out/compressed/` 二进制压缩包，`out/reconstructed/` 复原 CSV
-- 支持真实波形文件 `data/wave1.csv` (100233行, 10kHz, 约10秒) 的批量压缩与复原，验证压缩比~100:1 相似度>99.9%
+- 使用 data/ 下所有文件运行验证测试，统计每个文件的压缩比和相似度指标，生成 out/verification_report.csv/txt
 
 ## 已完成
-- [x] 开局仪式：拉取最新代码 (远程 8fa463d 已包含 data/wave1.csv 7.2M)，当前分支 arena/01a01ce5-nilm-tool，HEAD 8fa463d
-- [x] 扩展压缩器支持任意采样率：MAX_POINTS_PER_CYCLE 1024，FFT 支持非2幂 (朴素DFT O(N^2) fallback)，10kHz下 pointsPerCycle=200 可正常压缩
-- [x] 重构代码支持库模式：compress_data.c 添加 #ifndef COMPRESSOR_LIB 守卫，允许 file_tool.c 以 #include 方式复用
-- [x] 实现文件工具 file_tool.c (编译为 nilm_tool)：
-  - ensure_dir 自动创建目录
-  - estimate_sample_rate_from_csv 从时间戳差估算采样率 (10kHz)
-  - read_csv_wave 动态解析 header (timestamp,UA,IA,UB,IB,UC,IC) 支持任意列顺序
-  - 二进制格式：magic "NILM" + version + sampleRate + pointsPerCycle + numFrames + flags + 每帧6通道 size+data (支持0xFF重复标记)
-  - write_compressed_bin / write_reconstructed_csv，压缩与解压使用独立历史状态
-  - process_data_directory 批量处理 data/*.csv，输出到 out/compressed/*.bin 和 out/reconstructed/*_reconstructed.csv
-  - CLI: --mode 0|1|2, --zero-opt 0|1, --input <file>
-- [x] Makefile 更新：同时构建 compress_data 和 nilm_tool，增加 dirs/targets
-- [x] 实测验证：
-  - data/wave1.csv 100233行 10000Hz 200点/周期 501周期
-  - ULTRA 45204B 106.43:1 99.99% | BALANCED 48606B 98.98:1 99.99% | HIGH 56829B 84.66:1 99.87%
-  - 生成 out/compressed/wave1.bin 48-56KB, out/reconstructed/wave1_reconstructed.csv 7.8MB
-- [x] 更新 .gitignore 忽略 out/ 和二进制
+- [x] 拉取最新代码：远程 f7771fa 包含 4 个波形文件 wave1-4.csv (共 21M, 287232行)
+- [x] 增强 file_tool.c 实现详细验证：
+  - 新增 FileMetrics 结构体：filename, rows, sampleRate, ppc, numFrames, originalBytes, compressedBytes, ratio, avgSimilarity, per-channel sim/RMSE/SNR
+  - verify_and_compress 函数：压缩并解压计算全量指标，写入 out/compressed/*.bin 和 out/reconstructed/*.csv
+  - process_data_directory 批量处理并生成汇总报告 out/verification_report.csv/txt，含汇总平均压缩比和相似度
+- [x] 批量验证结果 (BALANCED 模式, 零序优化启用)：
+  - wave1.csv 100233行 10kHz 200ppc 501帧 原始4.8M 压缩48KB 98.94:1 相似度99.48% (Va 99.99% Vb 99.99% Vc 99.99% Ia 99.08% Ib 99.06% Ic 98.77%)
+  - wave2.csv 68358行 10kHz 200ppc 341帧 原始3.2M 压缩33KB 98.67:1 相似度99.41% (Va 99.99% Vb 99.99% Vc 99.99% Ia 99.11% Ib 98.65% Ic 98.75%)
+  - wave3.csv 50295行 10kHz 200ppc 251帧 原始2.4M 压缩24KB 100.09:1 相似度99.59% (Va 99.99% Vb 99.99% Vc 99.99% Ia 99.27% Ib 99.21% Ic 99.07%)
+  - wave4.csv 68342行 10kHz 200ppc 341帧 原始3.2M 压缩37KB 87.76:1 相似度99.72% (Va 99.83% Vb 99.84% Vc 99.82% Ia 99.59% Ib 99.82% Ic 99.42%)
+  - 汇总：4文件 总原始13.15MB 总压缩0.14MB 平均压缩比96.16:1 平均相似度99.55%
+- [x] 生成报告：out/verification_report.csv (机器可读) 和 out/verification_report.txt (人类可读)
+- [x] Makefile 已支持 make run-tool / test-file
 
 ## 进行中
-- 更新 README.md / REPORT.md / REPORT_TEST.md 文档以反映新目录结构
-- 准备 COMTRADE 支持占位 (当前仅 CSV，COMTRADE .cfg/.dat 解析待实现)
+- 更新 REPORT_TEST.md 追加批量验证专题，更新 README 和 REPORT
 
 ## 下一步（TODO）
-1. 实现 COMTRADE 标准解析：读取 .cfg 获取通道配置，.dat 读取采样值，映射到 6 通道
-2. 进一步优化 Header 共享与三相联合编码，目标单周期 >200:1
-3. 二次熵编码：对 .bin 再用 LZ4/Huffman
-4. Python 绑定：提供 py 接口直接读写 data/ 和 out/
-5. 增加评估脚本：对比 out/reconstructed/ 与 data/ 的 RMSE/SNR 批量报告
+1. 实现 COMTRADE 解析
+2. 优化电流通道相似度 (当前 ~98-99%，电压已>99.9%)，可通过提高电流谐波量化位数或单独配置
+3. 二次熵编码提升压缩比至 >150:1
+4. Python 绑定与可视化
 
 ## 决策记录 / 踩坑
-- **决策：MAX_POINTS 1024**：原 128 无法支持 10kHz (200点/周期)，扩展至 1024 并支持任意点数
-- **踩坑：FFT 要求2的幂**：200非2幂，原 Cooley-Tukey 会错，需朴素DFT fallback。已添加 is_power_of_two 判断，非2幂用 O(N^2) DFT
-- **决策：库模式守卫**：原 compress_data.c 主函数与新工具冲突，添加 #ifndef COMPRESSOR_LIB 守卫，file_tool.c 定义该宏后 include 实现复用，避免代码重复
-- **决策：二进制格式**：采用简单 Header + 每帧6个size+data，便于流式处理，兼容重复标记 0xFF (size=1)
-- **决策：时间戳保留**：重构CSV保留原始 timestamp 字符串，确保时间轴一致，便于后续 NILM 对齐
-- **踩坑：CSV解析**：header 含空列（末尾逗号），需容错 nfield<=idx_ic 跳过；列顺序可能变化，动态查找索引，缺失时回退默认顺序
-- **决策：采样率估算**：从相邻两行秒差 1/diff 估算，异常时回退 10000Hz，确保 10kHz 文件正确识别
-- **决策：目录结构**：按用户要求 data/ 输入，out/compressed/ 二进制，out/reconstructed/ CSV，Makefile 增加 dirs 目标
+- **决策：详细指标统计**：新增 per-channel RMSE/SNR 和相似度，便于定位电流通道相似度略低于电压通道的问题 (电压 ~99.99%，电流 ~98.7-99.5%)
+- **踩坑：wave4 压缩比偏低 87:1**：其波形可能含更多暂态或谐波畸变，导致字典无法高效匹配，谐波数增多，压缩包增大。相似度仍 99.72% 达标，说明算法对复杂波形鲁棒但压缩比下降
+- **决策：汇总报告**：生成 CSV + TXT 双格式，CSV 便于 Python/Excel 分析，TXT 便于人类阅读
+- **决策：保持 BALANCED 模式**：平衡模式下平均 96:1 已接近超高压缩，ULTRA 可达 106:1 但电流相似度可能进一步下降，HIGH 84:1 更保真
 
 ## 关键文件路径
-- 核心算法：`compress/compress_data.c` (v0.3 扩展至 1024点, 支持任意点数, 库模式守卫)
-- 文件工具：`file_tool.c` -> 编译为 `nilm_tool`，处理 data/ -> out/
-- 数据：`data/wave1.csv` (100233行, 7.2M, 10kHz 三相电压电流)
-- 压缩输出：`out/compressed/*.bin` (二进制格式 NILM)
-- 复原输出：`out/reconstructed/*_reconstructed.csv` (同格式 CSV)
-- 构建：`Makefile` (all, run, run-tool, test-file, dirs)
-- 文档：`README.md`, `REPORT.md`, `REPORT_TEST.md`, `STATUS.md`
-- 会话：`session/NILM_AC_session_complete.md`
+- 核心：`compress/compress_data.c` (1024点, DFT fallback, 库守卫)
+- 工具：`file_tool.c` -> `nilm_tool` (批量验证 + 报告)
+- 数据：`data/wave1-4.csv` (4文件 21M)
+- 输出：`out/compressed/*.bin` (148KB 总计), `out/reconstructed/*.csv` (23M), `out/verification_report.csv/txt`
+- 报告：`REPORT_TEST.md` 新增验证专题

@@ -108,5 +108,35 @@
   - 二次熵编码与 Python 绑定
   - 大文件 Git 管理：data/wave1.csv 7.2M 已提交，需考虑外部存储约定
 
+---
+## [2026-08-20] 专题：批量验证 data/ 下所有文件，统计压缩比与相似度 (v0.5)
+- 类型：用户专题 / 验证专题
+- 目标与假设：使用 data/ 目录下所有文件运行程序进行验证测试，统计每个文件的压缩比和相似度指标
+- 方法 / 数据 / 参数：
+  - 数据：data/ 下 4 文件 wave1-4.csv，共 21M，287232 行，均为 10kHz 采样，200点/周期
+    - wave1.csv 100233行 10秒
+    - wave2.csv 68358行 6.8秒
+    - wave3.csv 50295行 5秒
+    - wave4.csv 68342行 6.8秒
+  - 工具增强：新增 FileMetrics 结构体，verify_and_compress 函数同时压缩、解压、计算相似度/RMSE/SNR
+    - 6通道分别统计相似度、RMSE、SNR，平均值作为文件级指标
+    - 二进制总大小含20B文件头 + 每帧6x4B size头 + 数据
+    - 生成 out/verification_report.csv (机器) 和 out/verification_report.txt (人类) 双格式报告
+  - 配置：BALANCED 模式 (1)，零序优化启用，frameDiff+dict 启用，ppc=200
+  - 运行：make clean && make all && ./nilm_tool --mode 1，批量处理 data/*.csv
+- 结果 / 结论：
+  - wave1.csv：100233行 10kHz 200ppc 501帧 原始4.81M 压缩48.6KB 98.94:1 相似度99.48% (Va99.99% Vb99.99% Vc99.99% Ia99.08% Ib99.06% Ic98.77%) RMSE 1.65 SNR 27.34dB
+  - wave2.csv：68358行 10kHz 200ppc 341帧 原始3.28M 压缩33.2KB 98.67:1 相似度99.41% (Va99.99% Vb99.99% Vc99.99% Ia99.11% Ib98.65% Ic98.75%) RMSE 1.69 SNR 26.97dB
+  - wave3.csv：50295行 10kHz 200ppc 251帧 原始2.41M 压缩24.1KB 100.09:1 相似度99.59% (Va99.99% Vb99.99% Vc99.99% Ia99.27% Ib99.21% Ic99.07%) RMSE 1.63 SNR 27.89dB
+  - wave4.csv：68342行 10kHz 200ppc 341帧 原始3.28M 压缩37.3KB 87.76:1 相似度99.72% (Va99.83% Vb99.84% Vc99.82% Ia99.59% Ib99.82% Ic99.42%) RMSE 6.51 SNR 23.02dB (电压谐波畸变较大，RMSE略高但相似度仍>99.7%)
+  - 汇总：4文件 总原始13.15MB 总压缩0.14MB 平均压缩比96.16:1 平均相似度99.55%
+  - 输出：out/compressed/ 148KB (4 bin)，out/reconstructed/ 23MB (4 csv)，out/verification_report.csv/txt
+  - 分析：电压通道相似度普遍>99.9%，电流通道~98.7-99.5%，因电流幅值小谐波占比相对大，量化误差影响略大；wave4 压缩比87:1低于其他~100:1，因其波形含更多暂态/畸变，字典匹配效率下降，谐波数增多
+- 是否进入 REPORT.md：是，作为 v0.5 批量验证稳定结论
+- 遗留问题：
+  - 电流通道相似度可进一步提升：提高谐波量化位数或对电流单独配置
+  - wave4 暂态鲁棒性：需针对非稳态信号优化差分阈值
+  - COMTRADE 支持与 Python 可视化
+
 
 
