@@ -1,6 +1,6 @@
 /**
  * NILM 文件压缩工具 - 支持 data/ -> out/compressed/ -> out/reconstructed/
- * 新增：批量验证，统计每个文件的压缩比和相似度指标 -> out/verification_report.csv
+ * v0.6: 单周期 vs 多周期对比验证，统计每个文件在两种模式下的压缩比和相似度
  */
 
 #define COMPRESSOR_LIB
@@ -39,6 +39,11 @@ typedef struct {
     double perChannelRMSE[6];
     double perChannelSNR[6];
 } FileMetrics;
+
+typedef struct {
+    FileMetrics single; // 单周期：frameDiff=false
+    FileMetrics multi;  // 多周期：frameDiff=true
+} CombinedMetrics;
 
 static int ensure_dir(const char* path){
     char tmp[1024];
@@ -183,8 +188,8 @@ static void free_wave_data(WaveData* wd){
     free(wd);
 }
 
-/* 核心验证函数：压缩并解压，计算详细指标 */
-static FileMetrics verify_and_compress(const char* inputPath, const char* compOutPath, const char* reconOutPath, int mode, bool useZero){
+/* 核心：压缩并解压一个文件，支持单周期/多周期切换 */
+static FileMetrics verify_file(const char* inputPath, const char* compOutPath, const char* reconOutPath, int mode, bool useZero, bool multiCycle){
     FileMetrics metrics;
     memset(&metrics, 0, sizeof(metrics));
     strncpy(metrics.filename, inputPath, sizeof(metrics.filename)-1);
@@ -202,13 +207,11 @@ static FileMetrics verify_and_compress(const char* inputPath, const char* compOu
     metrics.numFrames = wd->n / ppc;
     metrics.originalBytes = (size_t)wd->n * 6 * sizeof(double);
 
-    printf("使用 pointsPerCycle=%d (sampleRate=%d) numFrames=%d\n", ppc, wd->sampleRate, metrics.numFrames);
     CompressionConfig config = create_config(wd->sampleRate, mode);
     config.enableZeroOptimization = useZero;
-    config.enableFrameDiff = true;
+    config.enableFrameDiff = multiCycle; // 单周期=false, 多周期=true
     config.enableDictEncoding = true;
 
-    // 打开压缩文件
     FILE* fcomp = fopen(compOutPath, "wb");
     FILE* frec = fopen(reconOutPath, "w");
     if(!fcomp || !frec){
@@ -217,7 +220,6 @@ static FileMetrics verify_and_compress(const char* inputPath, const char* compOu
         free_wave_data(wd);
         return metrics;
     }
-    // 写头
     fwrite("NILM",1,4,fcomp);
     uint32_t version=1;
     fwrite(&version,4,1,fcomp);
@@ -266,7 +268,6 @@ static FileMetrics verify_and_compress(const char* inputPath, const char* compOu
         int outN;
         decompress_three_phase(&compDec, &cd, Va_r, Vb_r, Vc_r, Ia_r, Ib_r, Ic_r, &outN);
 
-        // 计算该帧的相似度等
         double sims[6];
         sims[0]=calculate_similarity(wd->Va+off, Va_r, ppc);
         sims[1]=calculate_similarity(wd->Vb+off, Vb_r, ppc);
@@ -294,30 +295,23 @@ static FileMetrics verify_and_compress(const char* inputPath, const char* compOu
             rmsePerCh[ch]+=rmses[ch];
             snrPerCh[ch]+=snrs[ch];
         }
-        double avgSimThis = (sims[0]+sims[1]+sims[2]+sims[3]+sims[4]+sims[5])/6.0;
-        double avgRMSEThis = (rmses[0]+rmses[1]+rmses[2]+rmses[3]+rmses[4]+rmses[5])/6.0;
-        double avgSNRThis = (snrs[0]+snrs[1]+snrs[2]+snrs[3]+snrs[4]+snrs[5])/6.0;
-        totalSimAll+=avgSimThis;
-        totalRMSEAll+=avgRMSEThis;
-        totalSNRAll+=avgSNRThis;
+        totalSimAll+=(sims[0]+sims[1]+sims[2]+sims[3]+sims[4]+sims[5])/6.0;
+        totalRMSEAll+=(rmses[0]+rmses[1]+rmses[2]+rmses[3]+rmses[4]+rmses[5])/6.0;
+        totalSNRAll+=(snrs[0]+snrs[1]+snrs[2]+snrs[3]+snrs[4]+snrs[5])/6.0;
         frameCount++;
 
         for(int i=0;i<ppc;i++){
             int idx=off+i;
             if(idx>=wd->n) break;
             fprintf(frec, "%s,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n",
-                wd->timestamps[idx],
-                Va_r[i], Ia_r[i], Vb_r[i], Ib_r[i], Vc_r[i], Ic_r[i]);
+                wd->timestamps[idx], Va_r[i], Ia_r[i], Vb_r[i], Ib_r[i], Vc_r[i], Ic_r[i]);
         }
-
         free(Va_r); free(Vb_r); free(Vc_r); free(Ia_r); free(Ib_r); free(Ic_r);
         free_compressed_data(&cd);
     }
-
     fclose(fcomp);
     fclose(frec);
-
-    metrics.compressedBytes = totalCompressed + 20; // 含20字节文件头
+    metrics.compressedBytes = totalCompressed + 20;
     metrics.compressionRatio = (double)metrics.originalBytes / (metrics.compressedBytes?metrics.compressedBytes:1);
     if(frameCount>0){
         metrics.avgSimilarity = totalSimAll / frameCount;
@@ -329,19 +323,41 @@ static FileMetrics verify_and_compress(const char* inputPath, const char* compOu
             metrics.perChannelSNR[ch]=snrPerCh[ch]/frameCount;
         }
     }
-
-    printf("压缩文件已写入 %s: 原始 %zu 字节, 压缩 %zu 字节, 压缩比 %.2f:1\n", compOutPath, metrics.originalBytes, metrics.compressedBytes, metrics.compressionRatio);
-    printf("复原文件已写入 %s, 平均相似度 %.4f%% RMSE %.6f SNR %.2f dB\n", reconOutPath, metrics.avgSimilarity*100, metrics.avgRMSE, metrics.avgSNR);
-
     free_wave_data(wd);
     return metrics;
 }
 
-static void process_data_directory(int mode, bool useZero){
-    DIR* d = opendir(DATA_DIR);
-    if(!d){ printf("data 目录不存在，创建空目录\n"); ensure_dir(DATA_DIR); return; }
+/* 单文件同时跑单周期和多周期，返回两者对比 */
+static CombinedMetrics verify_both_modes(const char* inputPath, int mode, bool useZero){
+    CombinedMetrics combined;
+    memset(&combined, 0, sizeof(combined));
+    char baseName[512];
+    const char* slash=strrchr(inputPath,'/');
+    const char* name=slash?slash+1:inputPath;
+    strncpy(baseName, name, sizeof(baseName));
+    char* ext=strrchr(baseName,'.'); if(ext) *ext='\0';
 
-    // 收集所有 csv 文件
+    char compSingle[1024], reconSingle[1024];
+    char compMulti[1024], reconMulti[1024];
+    snprintf(compSingle, sizeof(compSingle), "%s/%s_single.bin", OUT_COMPRESSED_DIR, baseName);
+    snprintf(reconSingle, sizeof(reconSingle), "%s/%s_single_reconstructed.csv", OUT_RECONSTRUCTED_DIR, baseName);
+    snprintf(compMulti, sizeof(compMulti), "%s/%s_multi.bin", OUT_COMPRESSED_DIR, baseName);
+    snprintf(reconMulti, sizeof(reconMulti), "%s/%s_multi_reconstructed.csv", OUT_RECONSTRUCTED_DIR, baseName);
+
+    printf("\n--- 单周期压缩 (frameDiff=0) ---\n");
+    combined.single = verify_file(inputPath, compSingle, reconSingle, mode, useZero, false);
+    printf("单周期结果: 压缩比 %.2f:1 相似度 %.4f%%\n", combined.single.compressionRatio, combined.single.avgSimilarity*100);
+
+    printf("\n--- 多周期压缩 (frameDiff=1 + 0xFF重复) ---\n");
+    combined.multi = verify_file(inputPath, compMulti, reconMulti, mode, useZero, true);
+    printf("多周期结果: 压缩比 %.2f:1 相似度 %.4f%%\n", combined.multi.compressionRatio, combined.multi.avgSimilarity*100);
+
+    return combined;
+}
+
+static void process_data_directory_both(int mode, bool useZero){
+    DIR* d = opendir(DATA_DIR);
+    if(!d){ printf("data 目录不存在\n"); ensure_dir(DATA_DIR); return; }
     char fileList[64][512];
     int fileCount=0;
     struct dirent* entry;
@@ -354,138 +370,113 @@ static void process_data_directory(int mode, bool useZero){
         fileCount++;
     }
     closedir(d);
+    if(fileCount==0){ printf("data/ 下未找到 CSV\n"); return; }
 
-    if(fileCount==0){ printf("data/ 下未找到 CSV 文件\n"); return; }
-
-    // 打开汇总报告
     ensure_dir(OUT_REPORT_DIR);
     char reportPath[1024];
-    snprintf(reportPath, sizeof(reportPath), "%s/verification_report.csv", OUT_REPORT_DIR);
+    snprintf(reportPath, sizeof(reportPath), "%s/verification_report_single_multi.csv", OUT_REPORT_DIR);
     FILE* freport = fopen(reportPath, "w");
     if(freport){
-        fprintf(freport, "filename,rows,sampleRate,pointsPerCycle,numFrames,originalBytes,compressedBytes,compressionRatio,avgSimilarity,sim_Va,sim_Vb,sim_Vc,sim_Ia,sim_Ib,sim_Ic,avgRMSE,avgSNR\n");
+        fprintf(freport, "filename,rows,sampleRate,ppc,numFrames,originalBytes,"
+                "single_compBytes,single_ratio,single_sim,sim_Va_single,sim_Ia_single,rmse_single,snr_single,"
+                "multi_compBytes,multi_ratio,multi_sim,sim_Va_multi,sim_Ia_multi,rmse_multi,snr_multi,ratio_gain\n");
     }
     char reportTxtPath[1024];
-    snprintf(reportTxtPath, sizeof(reportTxtPath), "%s/verification_report.txt", OUT_REPORT_DIR);
+    snprintf(reportTxtPath, sizeof(reportTxtPath), "%s/verification_report_single_multi.txt", OUT_REPORT_DIR);
     FILE* freportTxt = fopen(reportTxtPath, "w");
     if(freportTxt){
-        fprintf(freportTxt, "NILM 压缩验证报告\n");
+        fprintf(freportTxt, "NILM 单周期 vs 多周期 压缩验证报告\n");
         fprintf(freportTxt, "========================================\n");
-        fprintf(freportTxt, "模式: %s (%d)  零序优化: %s\n", mode==0?"ULTRA":mode==1?"BALANCED":"HIGH", mode, useZero?"启用":"禁用");
-        fprintf(freportTxt, "时间: %s %s\n", __DATE__, __TIME__);
+        fprintf(freportTxt, "模式: %s 零序: %s 时间: %s %s\n", mode==0?"ULTRA":mode==1?"BALANCED":"HIGH", useZero?"启用":"禁用", __DATE__, __TIME__);
         fprintf(freportTxt, "========================================\n\n");
     }
 
-    double totalOrig=0, totalComp=0, totalSim=0;
+    double totalOrig=0, totalSingleComp=0, totalMultiComp=0, totalSingleSim=0, totalMultiSim=0;
     for(int i=0;i<fileCount;i++){
-        char inputPath[1024], compOut[1024], reconOut[1024];
+        char inputPath[1024];
         snprintf(inputPath, sizeof(inputPath), "%s/%s", DATA_DIR, fileList[i]);
-        char baseName[512];
-        strncpy(baseName, fileList[i], sizeof(baseName));
-        char* ext=strrchr(baseName, '.'); if(ext) *ext='\0';
-        snprintf(compOut, sizeof(compOut), "%s/%s.bin", OUT_COMPRESSED_DIR, baseName);
-        snprintf(reconOut, sizeof(reconOut), "%s/%s_reconstructed.csv", OUT_RECONSTRUCTED_DIR, baseName);
-        printf("\n=== 处理文件 [%d/%d]: %s ===\n", i+1, fileCount, inputPath);
-        FileMetrics m = verify_and_compress(inputPath, compOut, reconOut, mode, useZero);
+        printf("\n========== 文件 [%d/%d]: %s ==========\n", i+1, fileCount, inputPath);
+        CombinedMetrics cm = verify_both_modes(inputPath, mode, useZero);
 
-        totalOrig+=m.originalBytes;
-        totalComp+=m.compressedBytes;
-        totalSim+=m.avgSimilarity;
+        totalOrig+=cm.single.originalBytes;
+        totalSingleComp+=cm.single.compressedBytes;
+        totalMultiComp+=cm.multi.compressedBytes;
+        totalSingleSim+=cm.single.avgSimilarity;
+        totalMultiSim+=cm.multi.avgSimilarity;
 
         if(freport){
-            fprintf(freport, "%s,%d,%d,%d,%d,%zu,%zu,%.2f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.2f\n",
-                fileList[i], m.rows, m.sampleRate, m.pointsPerCycle, m.numFrames,
-                m.originalBytes, m.compressedBytes, m.compressionRatio,
-                m.avgSimilarity, m.similarities[0], m.similarities[1], m.similarities[2],
-                m.similarities[3], m.similarities[4], m.similarities[5],
-                m.avgRMSE, m.avgSNR);
+            double gain = cm.multi.compressionRatio / (cm.single.compressionRatio?cm.single.compressionRatio:1);
+            fprintf(freport, "%s,%d,%d,%d,%d,%zu,%zu,%.2f,%.6f,%.6f,%.6f,%.6f,%.2f,%zu,%.2f,%.6f,%.6f,%.6f,%.6f,%.2f,%.2f\n",
+                fileList[i], cm.single.rows, cm.single.sampleRate, cm.single.pointsPerCycle, cm.single.numFrames,
+                cm.single.originalBytes,
+                cm.single.compressedBytes, cm.single.compressionRatio, cm.single.avgSimilarity,
+                cm.single.similarities[0], cm.single.similarities[3], cm.single.avgRMSE, cm.single.avgSNR,
+                cm.multi.compressedBytes, cm.multi.compressionRatio, cm.multi.avgSimilarity,
+                cm.multi.similarities[0], cm.multi.similarities[3], cm.multi.avgRMSE, cm.multi.avgSNR,
+                gain);
         }
         if(freportTxt){
-            fprintf(freportTxt, "文件: %s\n", fileList[i]);
-            fprintf(freportTxt, "  行数: %d  采样率: %d Hz  每周期点数: %d  帧数: %d\n", m.rows, m.sampleRate, m.pointsPerCycle, m.numFrames);
-            fprintf(freportTxt, "  原始: %zu 字节  压缩: %zu 字节  压缩比: %.2f:1\n", m.originalBytes, m.compressedBytes, m.compressionRatio);
-            fprintf(freportTxt, "  平均相似度: %.4f%%  RMSE: %.6f  SNR: %.2f dB\n", m.avgSimilarity*100, m.avgRMSE, m.avgSNR);
-            fprintf(freportTxt, "  各通道相似度: Va %.4f%% Vb %.4f%% Vc %.4f%% Ia %.4f%% Ib %.4f%% Ic %.4f%%\n",
-                m.similarities[0]*100, m.similarities[1]*100, m.similarities[2]*100,
-                m.similarities[3]*100, m.similarities[4]*100, m.similarities[5]*100);
-            fprintf(freportTxt, "  各通道 RMSE: Va %.4f Vb %.4f Vc %.4f Ia %.4f Ib %.4f Ic %.4f\n",
-                m.perChannelRMSE[0], m.perChannelRMSE[1], m.perChannelRMSE[2],
-                m.perChannelRMSE[3], m.perChannelRMSE[4], m.perChannelRMSE[5]);
+            fprintf(freportTxt, "文件: %s (%d 行, %d Hz, %d 点/周期, %d 帧)\n", fileList[i], cm.single.rows, cm.single.sampleRate, cm.single.pointsPerCycle, cm.single.numFrames);
+            fprintf(freportTxt, "  原始大小: %zu 字节 (%.2f MB)\n", cm.single.originalBytes, cm.single.originalBytes/1024.0/1024.0);
+            fprintf(freportTxt, "  单周期: 压缩 %zu 字节  压缩比 %.2f:1  相似度 %.4f%%  RMSE %.4f  SNR %.2f dB\n",
+                cm.single.compressedBytes, cm.single.compressionRatio, cm.single.avgSimilarity*100, cm.single.avgRMSE, cm.single.avgSNR);
+            fprintf(freportTxt, "    通道: Va %.4f%% Ia %.4f%%\n", cm.single.similarities[0]*100, cm.single.similarities[3]*100);
+            fprintf(freportTxt, "  多周期: 压缩 %zu 字节  压缩比 %.2f:1  相似度 %.4f%%  RMSE %.4f  SNR %.2f dB\n",
+                cm.multi.compressedBytes, cm.multi.compressionRatio, cm.multi.avgSimilarity*100, cm.multi.avgRMSE, cm.multi.avgSNR);
+            fprintf(freportTxt, "    通道: Va %.4f%% Ia %.4f%%\n", cm.multi.similarities[0]*100, cm.multi.similarities[3]*100);
+            fprintf(freportTxt, "  增益: 多周期/单周期 = %.2fx (压缩比提升)\n", cm.multi.compressionRatio/(cm.single.compressionRatio?cm.single.compressionRatio:1));
             fprintf(freportTxt, "\n");
         }
     }
 
     if(fileCount>0){
-        double avgRatio = totalOrig / (totalComp?totalComp:1);
-        double avgSim = totalSim / fileCount;
+        double avgSingleRatio = totalOrig / (totalSingleComp?totalSingleComp:1);
+        double avgMultiRatio = totalOrig / (totalMultiComp?totalMultiComp:1);
         printf("\n========================================\n");
-        printf("汇总: %d 个文件\n", fileCount);
-        printf("总原始: %.2f MB  总压缩: %.2f MB  平均压缩比: %.2f:1  平均相似度: %.4f%%\n",
-            totalOrig/1024/1024, totalComp/1024/1024, avgRatio, avgSim*100);
-        printf("详细报告已写入: %s, %s\n", reportPath, reportTxtPath);
+        printf("汇总 %d 文件 总原始 %.2f MB\n", fileCount, totalOrig/1024/1024);
+        printf("单周期 总压缩 %.2f MB 平均压缩比 %.2f:1 平均相似度 %.4f%%\n", totalSingleComp/1024/1024, avgSingleRatio, totalSingleSim/fileCount*100);
+        printf("多周期 总压缩 %.2f MB 平均压缩比 %.2f:1 平均相似度 %.4f%%\n", totalMultiComp/1024/1024, avgMultiRatio, totalMultiSim/fileCount*100);
+        printf("多周期相对增益: %.2fx\n", avgMultiRatio/(avgSingleRatio?avgSingleRatio:1));
+        printf("报告: %s, %s\n", reportPath, reportTxtPath);
         if(freportTxt){
             fprintf(freportTxt, "========================================\n");
-            fprintf(freportTxt, "汇总: %d 个文件\n", fileCount);
-            fprintf(freportTxt, "总原始: %.2f MB  总压缩: %.2f MB  平均压缩比: %.2f:1  平均相似度: %.4f%%\n",
-                totalOrig/1024/1024, totalComp/1024/1024, avgRatio, avgSim*100);
+            fprintf(freportTxt, "汇总 %d 文件 总原始 %.2f MB\n", fileCount, totalOrig/1024/1024);
+            fprintf(freportTxt, "单周期 总压缩 %.2f MB 平均压缩比 %.2f:1 平均相似度 %.4f%%\n", totalSingleComp/1024/1024, avgSingleRatio, totalSingleSim/fileCount*100);
+            fprintf(freportTxt, "多周期 总压缩 %.2f MB 平均压缩比 %.2f:1 平均相似度 %.4f%%\n", totalMultiComp/1024/1024, avgMultiRatio, totalMultiSim/fileCount*100);
         }
     }
-
     if(freport) fclose(freport);
     if(freportTxt) fclose(freportTxt);
 }
 
 static void print_usage(const char* prog){
     printf("用法: %s [选项]\n", prog);
-    printf("  --mode <0|1|2>        压缩模式 0=极致 1=平衡(默认) 2=高质量\n");
-    printf("  --zero-opt <0|1>      是否启用零序优化 1=启用(默认) 0=禁用\n");
-    printf("  --input <file>        指定单个输入CSV文件 (默认处理 data/ 下所有CSV)\n");
-    printf("示例:\n");
-    printf("  %s --mode 1 --zero-opt 1\n", prog);
-    printf("  %s --input data/wave1.csv --mode 0\n", prog);
+    printf("  --mode <0|1|2>  压缩模式 0=极致 1=平衡(默认) 2=高质量\n");
+    printf("  --zero-opt <0|1> 零序优化\n");
+    printf("  --input <file> 单文件\n");
 }
 
 int main(int argc, char* argv[]){
-    int mode=COMPRESS_MODE_BALANCED;
+    int mode=1;
     bool useZero=true;
     const char* singleInput=NULL;
-
     for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"--mode")==0 && i+1<argc){
-            mode=atoi(argv[++i]);
-        }else if(strcmp(argv[i],"--zero-opt")==0 && i+1<argc){
-            useZero=atoi(argv[++i])!=0;
-        }else if(strcmp(argv[i],"--input")==0 && i+1<argc){
-            singleInput=argv[++i];
-        }else if(strcmp(argv[i],"--help")==0 || strcmp(argv[i],"-h")==0){
-            print_usage(argv[0]);
-            return 0;
-        }
+        if(strcmp(argv[i],"--mode")==0 && i+1<argc) mode=atoi(argv[++i]);
+        else if(strcmp(argv[i],"--zero-opt")==0 && i+1<argc) useZero=atoi(argv[++i])!=0;
+        else if(strcmp(argv[i],"--input")==0 && i+1<argc) singleInput=argv[++i];
+        else if(strcmp(argv[i],"--help")==0){ print_usage(argv[0]); return 0; }
     }
-
     ensure_dir(OUT_COMPRESSED_DIR);
     ensure_dir(OUT_RECONSTRUCTED_DIR);
     ensure_dir(DATA_DIR);
-
     if(singleInput){
-        char baseName[512];
-        const char* slash=strrchr(singleInput,'/');
-        const char* name=slash?slash+1:singleInput;
-        strncpy(baseName, name, sizeof(baseName));
-        char* ext=strrchr(baseName,'.'); if(ext) *ext='\0';
-        char compOut[1024], reconOut[1024];
-        snprintf(compOut, sizeof(compOut), "%s/%s.bin", OUT_COMPRESSED_DIR, baseName);
-        snprintf(reconOut, sizeof(reconOut), "%s/%s_reconstructed.csv", OUT_RECONSTRUCTED_DIR, baseName);
-        printf("处理单文件: %s\n", singleInput);
-        FileMetrics m = verify_and_compress(singleInput, compOut, reconOut, mode, useZero);
-        printf("\n验证完成: %s 压缩比 %.2f:1 相似度 %.4f%%\n", singleInput, m.compressionRatio, m.avgSimilarity*100);
+        printf("单文件双模式验证: %s\n", singleInput);
+        CombinedMetrics cm = verify_both_modes(singleInput, mode, useZero);
+        printf("\n单文件汇总:\n单周期 %.2f:1 %.4f%%  多周期 %.2f:1 %.4f%%\n",
+            cm.single.compressionRatio, cm.single.avgSimilarity*100,
+            cm.multi.compressionRatio, cm.multi.avgSimilarity*100);
     }else{
-        process_data_directory(mode, useZero);
+        process_data_directory_both(mode, useZero);
     }
-
-    printf("\n所有文件处理完成。\n");
-    printf("压缩文件位于: %s/\n", OUT_COMPRESSED_DIR);
-    printf("复原文件位于: %s/\n", OUT_RECONSTRUCTED_DIR);
-    printf("验证报告位于: %s/verification_report.csv / .txt\n", OUT_REPORT_DIR);
     return 0;
 }
