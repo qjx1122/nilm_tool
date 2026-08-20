@@ -1,0 +1,8 @@
+compress_data
+/tmp/
+*.o
+*.out
+test_result.txt
+*.bin
+*.dat
+data/
