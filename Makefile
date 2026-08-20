@@ -1,6 +1,6 @@
 CC=gcc
 CFLAGS=-O2 -Wall -Wextra
-LDFLAGS=-lm
+LDFLAGS=-lm -ldl
 SRC_COMPRESS=compress/compress_data.c
 BIN_COMPRESS=compress_data
 SRC_TOOL=file_tool.c
@@ -11,7 +11,7 @@ all: $(BIN_COMPRESS) $(BIN_TOOL)
 $(BIN_COMPRESS): $(SRC_COMPRESS)
 	$(CC) $(CFLAGS) $(SRC_COMPRESS) -o $(BIN_COMPRESS) $(LDFLAGS)
 
-$(BIN_TOOL): $(SRC_TOOL) $(SRC_COMPRESS)
+$(BIN_TOOL): $(SRC_TOOL) $(SRC_COMPRESS) entropy.c
 	$(CC) $(CFLAGS) $(SRC_TOOL) -o $(BIN_TOOL) $(LDFLAGS)
 
 run: $(BIN_COMPRESS)

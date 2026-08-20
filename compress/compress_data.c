@@ -603,6 +603,205 @@ void free_compressed_data(CompressedData* data){
     if(data->Ic){ free(data->Ic); data->Ic=NULL; }
     data->totalSize=0;
 }
+
+/* ============================================================
+ * 8. 三相联合编码 (Joint) - 适用于三相平衡
+ * 条件：零序能量小 (<1%) 且三相尺度相近 (max/min <1.2) 且均值接近0
+ * 若不满足，回退到独立编码
+ * ============================================================ */
+
+static void circular_shift(const double* src, double* dst, int n, int shift){
+    // shift >0 向右循环位移
+    shift %= n;
+    if(shift<0) shift+=n;
+    for(int i=0;i<n;i++){
+        int srcIdx = (i - shift + n) % n;
+        dst[i]=src[srcIdx];
+    }
+}
+
+// 检查三相是否平衡，返回 true 表示适合联合编码
+static bool is_balanced_three_phase(const double* Va, const double* Vb, const double* Vc,
+                                    const double* Ia, const double* Ib, const double* Ic,
+                                    int n, double* zeroRatioV, double* scaleRatioV, double* zeroRatioI, double* scaleRatioI){
+    // 计算三相电压零序
+    double sumV=0, sumI=0;
+    double maxVa=0, maxVb=0, maxVc=0, maxIa=0, maxIb=0, maxIc=0;
+    double meanVa=0, meanVb=0, meanVc=0, meanIa=0, meanIb=0, meanIc=0;
+    for(int i=0;i<n;i++){
+        double v0 = (Va[i]+Vb[i]+Vc[i])/3.0;
+        double i0 = (Ia[i]+Ib[i]+Ic[i])/3.0;
+        sumV+=v0*v0;
+        sumI+=i0*i0;
+        if(fabs(Va[i])>maxVa) maxVa=fabs(Va[i]);
+        if(fabs(Vb[i])>maxVb) maxVb=fabs(Vb[i]);
+        if(fabs(Vc[i])>maxVc) maxVc=fabs(Vc[i]);
+        if(fabs(Ia[i])>maxIa) maxIa=fabs(Ia[i]);
+        if(fabs(Ib[i])>maxIb) maxIb=fabs(Ib[i]);
+        if(fabs(Ic[i])>maxIc) maxIc=fabs(Ic[i]);
+        meanVa+=Va[i]; meanVb+=Vb[i]; meanVc+=Vc[i];
+        meanIa+=Ia[i]; meanIb+=Ib[i]; meanIc+=Ic[i];
+    }
+    meanVa/=n; meanVb/=n; meanVc/=n;
+    meanIa/=n; meanIb/=n; meanIc/=n;
+    double totalV=0, totalI=0;
+    for(int i=0;i<n;i++){
+        totalV+=Va[i]*Va[i]+Vb[i]*Vb[i]+Vc[i]*Vc[i];
+        totalI+=Ia[i]*Ia[i]+Ib[i]*Ib[i]+Ic[i]*Ic[i];
+    }
+    double zrV = totalV>1e-12 ? sumV/totalV : 0;
+    double zrI = totalI>1e-12 ? sumI/totalI : 0;
+    double maxV = fmax(maxVa, fmax(maxVb, maxVc));
+    double minV = fmin(maxVa, fmin(maxVb, maxVc));
+    double ratioV = minV>1e-9 ? maxV/minV : 10;
+    double maxI = fmax(maxIa, fmax(maxIb, maxIc));
+    double minI = fmin(maxIa, fmin(maxIb, maxIc));
+    double ratioI = minI>1e-9 ? maxI/minI : 10;
+    if(zeroRatioV) *zeroRatioV=zrV;
+    if(scaleRatioV) *scaleRatioV=ratioV;
+    if(zeroRatioI) *zeroRatioI=zrI;
+    if(scaleRatioI) *scaleRatioI=ratioI;
+    // 平衡条件：零序比<1% 且尺度比<1.2 且均值接近0 (<10V, <1A)
+    bool balancedV = (zrV<0.01 && ratioV<1.2 && fabs(meanVa)<10 && fabs(meanVb)<10 && fabs(meanVc)<10);
+    bool balancedI = (zrI<0.01 && ratioI<1.2 && fabs(meanIa)<1 && fabs(meanIb)<1 && fabs(meanIc)<1);
+    // 只要电压平衡就算可联合，电流独立判断
+    return balancedV; // 简化：以电压平衡为主要判断
+}
+
+// 三相联合压缩：以 Va 和 Ia 为参考，Vb,Vc,Ib,Ic 编码为残差
+CompressedData compress_three_phase_joint(HybridCompressor* comp,
+                                    const double* Va, const double* Vb, const double* Vc,
+                                    const double* Ia, const double* Ib, const double* Ic,
+                                    int n, bool* usedJoint){
+    CompressedData result;
+    memset(&result,0,sizeof(result));
+    if(n!=comp->N){
+        if(usedJoint) *usedJoint=false;
+        return result;
+    }
+    double zrV, srV, zrI, srI;
+    bool balanced = is_balanced_three_phase(Va,Vb,Vc,Ia,Ib,Ic,n,&zrV,&srV,&zrI,&srI);
+    if(!balanced){
+        if(usedJoint) *usedJoint=false;
+        return compress_three_phase(comp, Va,Vb,Vc,Ia,Ib,Ic,n);
+    }
+    if(usedJoint) *usedJoint=true;
+
+    // 公共尺度：电压取最大，电流取最大
+    double maxVa=0,maxVb=0,maxVc=0,maxIa=0,maxIb=0,maxIc=0;
+    for(int i=0;i<n;i++){
+        if(fabs(Va[i])>maxVa) maxVa=fabs(Va[i]);
+        if(fabs(Vb[i])>maxVb) maxVb=fabs(Vb[i]);
+        if(fabs(Vc[i])>maxVc) maxVc=fabs(Vc[i]);
+        if(fabs(Ia[i])>maxIa) maxIa=fabs(Ia[i]);
+        if(fabs(Ib[i])>maxIb) maxIb=fabs(Ib[i]);
+        if(fabs(Ic[i])>maxIc) maxIc=fabs(Ic[i]);
+    }
+    double commonScaleV = fmax(maxVa, fmax(maxVb, maxVc));
+    double commonScaleI = fmax(maxIa, fmax(maxIb, maxIc));
+    if(commonScaleV<1e-9) commonScaleV=1.0;
+    if(commonScaleI<1e-9) commonScaleI=1.0;
+
+    // 构造参考通道：Va 和 Ia 用公共尺度压缩为参考
+    // 为简化，直接使用原有 compress_channel 作为参考，额外存储公共尺度信息在结果中？
+    // 实现：先压缩 Va, Ia 作为参考
+    result.Va = compress_channel(comp, Va, n, 0, &result.sizeVa);
+    result.Ia = compress_channel(comp, Ia, n, 3, &result.sizeIa);
+
+    // 计算期望的 Vb, Vc 通过循环位移
+    int shift = n/3; // 120度 = N/3
+    double* expVb = (double*)malloc(n*sizeof(double));
+    double* expVc = (double*)malloc(n*sizeof(double));
+    double* expIb = (double*)malloc(n*sizeof(double));
+    double* expIc = (double*)malloc(n*sizeof(double));
+    if(!expVb||!expVc||!expIb||!expIc){
+        if(expVb) free(expVb); if(expVc) free(expVc); if(expIb) free(expIb); if(expIc) free(expIc);
+        free_compressed_data(&result);
+        if(usedJoint) *usedJoint=false;
+        return compress_three_phase(comp, Va,Vb,Vc,Ia,Ib,Ic,n);
+    }
+    circular_shift(Va, expVb, n, shift); // Va 延迟 120度 得到 Vb
+    circular_shift(Va, expVc, n, -shift); // Va 提前 120度 得到 Vc
+    circular_shift(Ia, expIb, n, shift);
+    circular_shift(Ia, expIc, n, -shift);
+
+    // 残差
+    double* resVb = (double*)malloc(n*sizeof(double));
+    double* resVc = (double*)malloc(n*sizeof(double));
+    double* resIb = (double*)malloc(n*sizeof(double));
+    double* resIc = (double*)malloc(n*sizeof(double));
+    if(!resVb||!resVc||!resIb||!resIc){
+        free(expVb); free(expVc); free(expIb); free(expIc);
+        if(resVb) free(resVb); if(resVc) free(resVc); if(resIb) free(resIb); if(resIc) free(resIc);
+        free_compressed_data(&result);
+        if(usedJoint) *usedJoint=false;
+        return compress_three_phase(comp, Va,Vb,Vc,Ia,Ib,Ic,n);
+    }
+    for(int i=0;i<n;i++){
+        resVb[i]=Vb[i]-expVb[i];
+        resVc[i]=Vc[i]-expVc[i];
+        resIb[i]=Ib[i]-expIb[i];
+        resIc[i]=Ic[i]-expIc[i];
+    }
+
+    // 压缩残差：残差能量小，压缩后尺寸很小
+    result.Vb = compress_channel(comp, resVb, n, 1, &result.sizeVb);
+    result.Vc = compress_channel(comp, resVc, n, 2, &result.sizeVc);
+    result.Ib = compress_channel(comp, resIb, n, 4, &result.sizeIb);
+    result.Ic = compress_channel(comp, resIc, n, 5, &result.sizeIc);
+
+    free(expVb); free(expVc); free(expIb); free(expIc);
+    free(resVb); free(resVc); free(resIb); free(resIc);
+
+    result.totalSize = result.sizeVa + result.sizeVb + result.sizeVc + result.sizeIa + result.sizeIb + result.sizeIc;
+    return result;
+}
+
+void decompress_three_phase_joint(HybridCompressor* comp, const CompressedData* data,
+                            double* Va, double* Vb, double* Vc,
+                            double* Ia, double* Ib, double* Ic,
+                            int* outN){
+    int n;
+    double* pVa = decompress_channel(comp, data->Va, data->sizeVa, 0, &n);
+    double* pIa = decompress_channel(comp, data->Ia, data->sizeIa, 3, &n);
+    double* pVb_res = decompress_channel(comp, data->Vb, data->sizeVb, 1, &n);
+    double* pVc_res = decompress_channel(comp, data->Vc, data->sizeVc, 2, &n);
+    double* pIb_res = decompress_channel(comp, data->Ib, data->sizeIb, 4, &n);
+    double* pIc_res = decompress_channel(comp, data->Ic, data->sizeIc, 5, &n);
+
+    if(pVa && pIa && pVb_res && pVc_res && pIb_res && pIc_res){
+        int shift = n/3;
+        double* expVb = (double*)malloc(n*sizeof(double));
+        double* expVc = (double*)malloc(n*sizeof(double));
+        double* expIb = (double*)malloc(n*sizeof(double));
+        double* expIc = (double*)malloc(n*sizeof(double));
+        circular_shift(pVa, expVb, n, shift);
+        circular_shift(pVa, expVc, n, -shift);
+        circular_shift(pIa, expIb, n, shift);
+        circular_shift(pIa, expIc, n, -shift);
+        for(int i=0;i<n;i++){
+            Va[i]=pVa[i];
+            Vb[i]=expVb[i]+pVb_res[i];
+            Vc[i]=expVc[i]+pVc_res[i];
+            Ia[i]=pIa[i];
+            Ib[i]=expIb[i]+pIb_res[i];
+            Ic[i]=expIc[i]+pIc_res[i];
+        }
+        *outN=n;
+        free(expVb); free(expVc); free(expIb); free(expIc);
+    }else{
+        *outN=0;
+    }
+    if(pVa) free(pVa);
+    if(pIa) free(pIa);
+    if(pVb_res) free(pVb_res);
+    if(pVc_res) free(pVc_res);
+    if(pIb_res) free(pIb_res);
+    if(pIc_res) free(pIc_res);
+}
+
+
+
 CompressionConfig create_config(int sampleRate,int mode){
     CompressionConfig config; memset(&config,0,sizeof(config));
     config.sampleRate=sampleRate; config.pointsPerCycle=sampleRate/50;
