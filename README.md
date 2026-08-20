@@ -1,115 +1,116 @@
 # NILM_Tool - 三相电压电流波形混合智能压缩
 
-> NILM (Non-Intrusive Load Monitoring) 工具箱中的波形压缩与复原模块，针对电网现场采集数据的高压缩比存储与传输场景。
+> NILM 工具箱中的波形压缩与复原模块，支持现场 CSV/COMTRADE 批量处理，输出到 `out/` 目录。
 
 ## 功能特性
-- **可配置采样率**：默认 6.4 kHz，支持任意采样率（每周期点数 = sampleRate / 50）
-- **高压缩比**：单周期 60-100:1，多周期帧间差分 384:1 (10周期) / 548:1 (50周期)（稳态周期信号）
-- **高保真复原**：相似度 >99.6%（余弦相似度），支持 RMSE / SNR 评估
-- **混合压缩技术**：
-  - FFT 频域压缩 + 自适应谐波选择
-  - 谐波字典编码（6 种预定义模式，择优使用，含基波幅相）
-  - 帧间差分 + 高效重复帧标记 0xFF（1字节/通道 表示重复前一周期）
-  - 零序优化（Clarke 变换 αβ0 域压缩，零序能量<0.001时 1字节表示）
-- **三模式**：
-  - ULTRA (0): 极致压缩，目标相似度 95%，实测单周期 102:1 / 99.85%
-  - BALANCED (1): 平衡，目标 97%，实测 93:1 / 99.69%（含字典优化）
-  - HIGH_QUALITY (2): 高质量，目标 99%，实测 93:1 / 99.66%
+- **可配置采样率**：支持任意采样率（默认 6.4kHz，实测 10kHz@data/wave1.csv），pointsPerCycle = sampleRate/50，最大 1024点，FFT 支持非2幂（DFT fallback）
+- **高压缩比**：单周期 60-106:1，10周期 384:1，50周期 548:1；真实文件 data/wave1.csv (100233行 10kHz) 实测 98.98:1 相似度 99.99%
+- **高保真复原**：余弦相似度 >99.6%，支持 RMSE / SNR
+- **混合压缩技术**：FFT频域 + 自适应谐波 + 字典择优 + 帧间差分重复标记 0xFF + 零序优化
+- **文件化 I/O**：`data/` 输入，`out/compressed/` 二进制，`out/reconstructed/` CSV
+
+## 目录结构（用户要求）
+```
+nilm_tool/
+├── data/                         # 现场采集 CSV / COMTRADE
+│   └── wave1.csv                 # 示例：100233行 timestamp,UA,IA,UB,IB,UC,IC 10kHz
+├── out/
+│   ├── compressed/               # 压缩后二进制 *.bin
+│   │   └── wave1.bin             # 格式: NILM magic + header + 每帧6通道 size+data
+│   └── reconstructed/            # 复原波形 CSV
+│       └── wave1_reconstructed.csv # 同输入格式，timestamp,UA,IA,UB,IB,UC,IC
+├── compress/
+│   └── compress_data.c           # 核心压缩库 (v0.3+，支持1024点，库模式守卫)
+├── file_tool.c                   # 文件批处理工具 -> 编译为 nilm_tool
+├── Makefile
+└── README.md
+```
+
+**二进制格式** (`out/compressed/*.bin`)：
+```
+Header (20B):
+  magic 4B "NILM"
+  version u32 (1)
+  sampleRate i32
+  pointsPerCycle i32
+  numFrames i32
+  flags i32 (bit0=zeroOpt, bit1=dict, bit2=frameDiff)
+Per Frame (numFrames 次):
+  sizes[6] u32[6]  # Va,Vb,Vc,Ia,Ib,Ic 各通道压缩后大小
+  data0 size0 B
+  data1 size1 B
+  ...
+  data5 size5 B
+  (size==1 && data[0]==0xFF 表示重复前一帧，极致压缩)
+```
 
 ## 安装 / 环境
-- 依赖：GCC (≥11) + libm，无第三方库
-- 系统：Linux / macOS / Windows + MinGW
 ```bash
 gcc --version
-# Debian 示例
 sudo apt-get install build-essential
 ```
 
 ## 运行命令
 ```bash
-# 编译
-gcc compress/compress_data.c -o compress_data -lm -O2 -Wall
+# 编译两个二进制：compress_data (基准测试) 和 nilm_tool (文件工具)
+make all
 
-# 运行基准测试（内置三相含谐波测试信号，128点/周期 + 多周期高压缩比演示）
+# 基准测试（内置合成信号）
 ./compress_data
 
-# 或使用 setup.sh
-./setup.sh
+# 文件压缩工具 - 处理 data/ 下所有 CSV
+make dirs
+./nilm_tool --mode 1 --zero-opt 1
+# 或指定单文件
+./nilm_tool --input data/wave1.csv --mode 0
 
-# 或 Makefile（如已创建）
-make run
+# 查看结果
+ls -lh out/compressed/ out/reconstructed/
+head out/reconstructed/wave1_reconstructed.csv
+
+# Makefile 快捷
+make run          # 基准测试
+make run-tool     # 文件批处理
+make test-file    # 单文件测试
 ```
 
-**v0.3 实测示例输出（节选）**：
+**实测输出** (data/wave1.csv 10kHz)：
 ```
-  压缩模式: 极致压缩
-  原始大小: 6144 字节  压缩后大小: 60 字节  压缩比: 102.40:1  平均相似度: 99.85% ✅
+读取 data/wave1.csv: 100233 行, 估算采样率 10000 Hz
+使用 pointsPerCycle=200 (sampleRate=10000)
+压缩文件已写入 out/compressed/wave1.bin: 原始 4811184 字节, 压缩 48606 字节, 压缩比 98.98:1
+复原文件已写入 out/reconstructed/wave1_reconstructed.csv, 平均相似度 99.9918%
 
-  压缩模式: 平衡模式
-  原始大小: 6144 字节  压缩后大小: 66 字节  压缩比: 93.09:1   平均相似度: 99.69% ✅
-
-  多周期帧间差分测试 (10 周期)
-  总原始大小: 61440 字节  总压缩大小: 160 字节  平均压缩比: 384.00:1 ✅
-
-  多周期帧间差分测试 (50 周期)
-  总原始大小: 307200 字节  总压缩大小: 560 字节  平均压缩比: 548.57:1 ✅
+模式对比：
+  ULTRA (0): 45204B 106.43:1 99.99%
+  BALANCED (1): 48606B 98.98:1 99.99%
+  HIGH (2): 56829B 84.66:1 99.87%
 ```
 
-## 数据目录结构
-- **当前版本**：无外部数据依赖，测试信号由 `generate_test_signal()` 生成（220V 三相正弦 + 3次/5次谐波，电流 50A + 3次谐波，50Hz）
-- **多周期测试**：内部生成 10/50 周期相同波形，触发重复帧标记，验证高压缩比
-- **推荐扩展**：
-  - `data/raw/`：现场采集 CSV / COMTRADE
-  - `data/compressed/`：压缩后二进制
-  - `data/reconstructed/`：复原波形 CSV
-  - 大文件勿入 Git，遵循 .gitignore
-
-## 配置文件结构
+## 配置
 ```c
-typedef struct {
-    int sampleRate;                // Hz, 默认6400
-    int pointsPerCycle;            // = sampleRate/50
-    double targetSimilarity;       // 目标相似度
-    int minHarmonics;              // 最少谐波
-    int maxHarmonics;              // 最多谐波
-    double deadZoneThreshold;      // 死区阈值
-    int quantBitsFundamental;      // 基波量化位数
-    int quantBitsHarmonic;         // 谐波量化位数
-    bool enableDictEncoding;       // 字典编码
-    bool enableFrameDiff;          // 帧间差分+重复帧
-    bool enableZeroOptimization;   // 零序优化
-    bool enableAdaptiveHarmonics;  // 自适应
-} CompressionConfig;
+create_config(sampleRate, mode) // mode 0=ULTRA 1=BALANCED 2=HIGH_QUALITY
+// 默认启用 dict, frameDiff, zeroOpt, adaptive
 ```
-工厂：`create_config(sampleRate, mode)` 默认启用 dict、frameDiff、zero、adaptive。
 
-## 输出产物
-- **控制台**：每种模式原始/压缩大小、压缩比、压缩率、6通道相似度、平均 RMSE / SNR、通过状态；多周期平均压缩比
-- **统计**：totalFrames / dictUsed / diffUsed / avgHarmonics
-- **未来**：输出压缩包文件与复原 CSV 对接 Python NILM
+## 生产流程
+1. **采集**：现场设备导出 CSV (`timestamp,UA,IA,UB,IB,UC,IC`) 或 COMTRADE (.cfg/.dat) 放入 `data/`
+2. **压缩**：`./nilm_tool --mode 1` 批量处理，生成 `out/compressed/*.bin`
+3. **传输/存储**：.bin 文件可直接存储或通过 MQTT/CoAP 传输，重复帧仅 1B/通道
+4. **复原**：工具自动生成 `out/reconstructed/*.csv`，或调用 `decompress_three_phase()` 在接收端重建
+5. **评估**：对比 `data/` 与 `out/reconstructed/` 计算相似度/RMSE/SNR
+6. **NILM**：复原 CSV 可直接输入 Python NILM 模型
 
-## 生产推荐流程
-1. 现场采集 6.4kHz 三相电压电流，整理为每周期 128 点 double
-2. 配置：BALANCED 默认；带宽受限 ULTRA；谐波分析 HIGH_QUALITY
-3. 三相压缩：`compress_three_phase()` 或 `compress_with_zero_optimization()`（三相平衡时推荐，零序自动 1字节）
-4. 长期存储：启用 frameDiff，首帧完整，后续重复帧仅 1字节/通道（0xFF），平均比 >300:1
-5. 传输：传输 CompressedData 6段二进制 + size，重复帧特殊标记可进一步与 MQTT/CoAP 结合
-6. 复原：`decompress_three_phase()` / `decompress_with_zero_optimization()`，接收端保持历史状态以支持重复帧
-7. 评估：`evaluate_compression()` / `evaluate_compression_zero()` 计算相似度、RMSE、SNR
+## COMTRADE 支持
+- 当前版本主要支持 CSV，COMTRADE 预留接口
+- 计划：解析 .cfg 获取通道配置，.dat 读取采样值，映射到 6 通道
+- 临时方案：若有 .cfg/.dat，可先转换为 CSV 格式 `timestamp,UA,IA,...` 再处理
 
-## 关键修复与演进
-- **v0.1**：初始提交，编译失败
-- **v0.2**：修复 FFT 幅度量化（归一化 2*|F|/N）、harmCount 顺序、零序评估，相似度 >99.8%，单周期 60-100:1
-- **v0.3**：增加 prevMean/prevScale、高效重复帧 0xFF、重设计字典编码含基波幅相、多周期测试 384:1/548:1，重新启用字典/差分
-
-## 当前本地状态
-- 分支：`arena/01a01ce5-nilm-tool`
-- 最新提交：修复版 v0.3
-- 已知限制：单周期压缩比仍受 header 5字节限制，<150:1，需三相联合编码或二次熵编码进一步提升
-- 下一步：共享 scale/mean，三相联合幅相编码，Huffman 二次压缩
+## 演进
+- v0.1 编译失败
+- v0.2 修复量化与顺序，相似度>99.8% 单周期60-100:1
+- v0.3 重复帧 0xFF 多周期384:1/548:1
+- v0.4 (当前) 支持 data/ out/ 目录结构，10kHz真实波形，1024点，任意点DFT，文件工具 nilm_tool，二进制格式，提供 batch 处理
 
 ## 开发仪式
-遵循 `BOOTSTRAP.md`：
-- 开局：`git status/log` + `cat STATUS.md` + `gh auth status` + 检查环境
-- 决策落盘到 `STATUS.md`
-- 收尾：更新 `STATUS.md` + 追加 `session/NILM_AC_session_complete.md` + 更新 `REPORT.md`/`README.md` + 追加 `REPORT_TEST.md`，提交推送
+遵循 BOOTSTRAP.md 开局与收尾。

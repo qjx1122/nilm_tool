@@ -1,8 +1,20 @@
+# Binaries
 compress_data
-/tmp/
+nilm_tool
 *.o
 *.out
-test_result.txt
 *.bin
 *.dat
-data/
+*.exe
+
+# Temp
+/tmp/
+test_result.txt
+out/
+# data/ 保留示例，但大文件建议外部存储
+# data/*.csv 保留小样例，超大文件可忽略
+# data/*.dat
+
+# OS
+.DS_Store
+Thumbs.db
