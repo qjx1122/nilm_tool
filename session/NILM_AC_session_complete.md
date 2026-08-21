@@ -68,3 +68,18 @@
 - 相关文件/分支：file_tool.c (增强验证报告), data/wave1-4.csv, out/verification_report.csv/txt / arena/01a01ce5-nilm-tool
 
 
+
+## [2026-08-20] 会话纪要 - 生成算法设计详细说明文档 (v0.9)
+- 目标：根据代码生成本算法设计详细说明文档
+- 完成项：
+  - 拉取最新 70b89d8，确认 data/wave1-4.csv 和 joint+entropy+comparison 已实现
+  - 核心库新增显式周波API：compress_single_cycle, decompress_single_cycle, compress_single_cycle_joint, decompress_single_cycle_joint, MultiCycleCompressedData, compress_multi_cycle, decompress_multi_cycle, evaluate_multi_cycle, free_multi_cycle_data
+  - 生成 ALGORITHM_DESIGN.md (13K) 和 docs/ALGORITHM_DESIGN.md，详细说明 9 大算法、条件限制、文件格式、验证结果
+  - 更新 STATUS.md 为 v0.9 设计文档任务
+  - 验证：make clean && make all && ./nilm_tool 批量验证 4 文件，单独立96:1 单联合101:1 多联合+LZ4 157:1，相似度>98.5%，对比文件 out/comparison/ 已生成
+- 关键决策：
+  - 以周波为单位明确区分单周波独立与多周波批量，符合用户要求
+  - 设计文档按代码结构生成，确保与实现一致
+  - 保留对比文件 out/comparison/ 作为验证产物
+- 未决问题：COMTRADE 解析、Python 绑定
+- 相关文件/分支：ALGORITHM_DESIGN.md, docs/ALGORITHM_DESIGN.md, compress/compress_data.c (周波API), entropy.c, file_tool.c / arena/01a01ce5-nilm-tool
