@@ -1,6 +1,6 @@
 /**
- * NILM v0.7 - 单周期/多周期 + 三相联合 + 二次熵编码 (LZ4/Huffman)
- * 输入 data/*.csv -> 输出 out/
+ * NILM v0.8 - 单周期/多周期 + 三相联合 + 二次熵编码 + 对比文件
+ * 输入 data/*.csv -> 输出 out/compressed/, out/reconstructed/, out/comparison/
  */
 
 #define COMPRESSOR_LIB
@@ -12,6 +12,7 @@
 
 #define OUT_COMPRESSED_DIR "out/compressed"
 #define OUT_RECONSTRUCTED_DIR "out/reconstructed"
+#define OUT_COMPARISON_DIR "out/comparison"
 #define OUT_REPORT_DIR "out"
 #define DATA_DIR "data"
 
@@ -35,16 +36,21 @@ static int ensure_dir(const char* path){
     char tmp[1024];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for(char* p=tmp+1; *p; p++){ if(*p=='/'){ *p='\0'; mkdir(tmp,0755); *p='/'; } }
-    mkdir(tmp,0755); return 0;
+    mkdir(tmp,0755);
+    return 0;
 }
 static double parse_sec_from_ts(const char* ts){
-    const char* ls=strrchr(ts,' '); if(!ls) return 0;
-    const char* c1=strchr(ls,':'); if(!c1) return 0;
-    const char* c2=strchr(c1+1,':'); if(!c2) return 0;
+    const char* ls=strrchr(ts,' ');
+    if(!ls) return 0;
+    const char* c1=strchr(ls,':');
+    if(!c1) return 0;
+    const char* c2=strchr(c1+1,':');
+    if(!c2) return 0;
     return atof(c2+1);
 }
 static int estimate_sample_rate(const char* path){
-    FILE* f=fopen(path,"r"); if(!f) return 10000;
+    FILE* f=fopen(path,"r");
+    if(!f) return 10000;
     char line[2048];
     if(!fgets(line,sizeof(line),f)){ fclose(f); return 10000; }
     if(!fgets(line,sizeof(line),f)){ fclose(f); return 10000; }
@@ -60,7 +66,8 @@ static int estimate_sample_rate(const char* path){
     return sr;
 }
 static WaveData* read_csv_wave(const char* path){
-    FILE* f=fopen(path,"r"); if(!f) return NULL;
+    FILE* f=fopen(path,"r");
+    if(!f) return NULL;
     char line[4096];
     if(!fgets(line,sizeof(line),f)){ fclose(f); return NULL; }
     int idx_ts=-1,idx_ua=-1,idx_ia=-1,idx_ub=-1,idx_ib=-1,idx_uc=-1,idx_ic=-1;
@@ -138,13 +145,24 @@ static SimpleMetrics compress_file_mode(WaveData* wd, const char* compPath, cons
 
     FILE* fcomp=fopen(compPath,"wb");
     FILE* frec=fopen(reconPath,"w");
-    if(!fcomp||!frec){ if(fcomp) fclose(fcomp); if(frec) fclose(frec); return res; }
+    // comparison file path
+    char compaPath[1024]={0};
+    {
+        const char* slash=strrchr(compPath,'/');
+        const char* name=slash?slash+1:compPath;
+        char b[512]; strncpy(b,name,sizeof(b)); char* dot=strrchr(b,'.'); if(dot) *dot='\0';
+        snprintf(compaPath,sizeof(compaPath),"%s/%s_comparison.csv",OUT_COMPARISON_DIR,b);
+    }
+    ensure_dir(OUT_COMPARISON_DIR);
+    FILE* fcompa=fopen(compaPath,"w");
+    if(!fcomp||!frec){ if(fcomp) fclose(fcomp); if(frec) fclose(frec); if(fcompa) fclose(fcompa); return res; }
     fwrite("NILM",1,4,fcomp);
     uint32_t ver=1; fwrite(&ver,4,1,fcomp);
     int32_t sr=wd->sampleRate, ppc_i=ppc, nf=frames, fl=0;
     if(useZero) fl|=1; if(config.enableDictEncoding) fl|=2; if(multiCycle) fl|=4; if(useJoint) fl|=8;
     fwrite(&sr,4,1,fcomp); fwrite(&ppc_i,4,1,fcomp); fwrite(&nf,4,1,fcomp); fwrite(&fl,4,1,fcomp);
     fprintf(frec,"timestamp,UA,IA,UB,IB,UC,IC\n");
+    if(fcompa) fprintf(fcompa,"timestamp,UA_orig,UA_recon,UA_err,IA_orig,IA_recon,IA_err,UB_orig,UB_recon,UB_err,IB_orig,IB_recon,IB_err,UC_orig,UC_recon,UC_err,IC_orig,IC_recon,IC_err\n");
 
     HybridCompressor enc, dec;
     compressor_init(&enc,&config);
@@ -187,11 +205,25 @@ static SimpleMetrics compress_file_mode(WaveData* wd, const char* compPath, cons
         else decompress_three_phase(&dec,&cd,Va_r,Vb_r,Vc_r,Ia_r,Ib_r,Ic_r,&outN);
         double sim=(calculate_similarity(wd->Va+off,Va_r,ppc)+calculate_similarity(wd->Vb+off,Vb_r,ppc)+calculate_similarity(wd->Vc+off,Vc_r,ppc)+calculate_similarity(wd->Ia+off,Ia_r,ppc)+calculate_similarity(wd->Ib+off,Ib_r,ppc)+calculate_similarity(wd->Ic+off,Ic_r,ppc))/6.0;
         totalSim+=sim;
-        for(int k=0;k<ppc;k++){ int idx=off+k; if(idx>=wd->n) break; fprintf(frec,"%s,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n",wd->timestamps[idx],Va_r[k],Ia_r[k],Vb_r[k],Ib_r[k],Vc_r[k],Ic_r[k]); }
+        for(int k=0;k<ppc;k++){
+            int idx=off+k;
+            if(idx>=wd->n) break;
+            fprintf(frec,"%s,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n",wd->timestamps[idx],Va_r[k],Ia_r[k],Vb_r[k],Ib_r[k],Vc_r[k],Ic_r[k]);
+            if(fcompa){
+                fprintf(fcompa,"%s,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n",
+                    wd->timestamps[idx],
+                    wd->Va[off+k], Va_r[k], wd->Va[off+k]-Va_r[k],
+                    wd->Ia[off+k], Ia_r[k], wd->Ia[off+k]-Ia_r[k],
+                    wd->Vb[off+k], Vb_r[k], wd->Vb[off+k]-Vb_r[k],
+                    wd->Ib[off+k], Ib_r[k], wd->Ib[off+k]-Ib_r[k],
+                    wd->Vc[off+k], Vc_r[k], wd->Vc[off+k]-Vc_r[k],
+                    wd->Ic[off+k], Ic_r[k], wd->Ic[off+k]-Ic_r[k]);
+            }
+        }
         free(Va_r); free(Vb_r); free(Vc_r); free(Ia_r); free(Ib_r); free(Ic_r);
         free_compressed_data(&cd);
     }
-    fclose(fcomp); fclose(frec);
+    fclose(fcomp); fclose(frec); if(fcompa) fclose(fcompa);
     res.compBytes=totalComp+20;
     res.ratio=(double)origBytes/(res.compBytes?res.compBytes:1);
     res.sim=frames?totalSim/frames:0;
@@ -211,6 +243,7 @@ int main(int argc, char* argv[]){
     }
     ensure_dir(OUT_COMPRESSED_DIR);
     ensure_dir(OUT_RECONSTRUCTED_DIR);
+    ensure_dir(OUT_COMPARISON_DIR);
     ensure_dir(DATA_DIR);
 
     char fileList[64][512];
@@ -240,12 +273,13 @@ int main(int argc, char* argv[]){
     if(frepTxt){
         fprintf(frepTxt,"NILM 单周期/多周期 + 三相联合 + 熵编码 验证报告\n");
         fprintf(frepTxt,"模式 BALANCED 零序启用\n");
-        fprintf(frepTxt,"联合条件: 零序<1%% 且 尺度比<1.2 且均值接近0，否则回退独立\n");
-        fprintf(frepTxt,"熵编码条件: 二次后 < 一次*0.95 且 >64B 时使用\n");
+        fprintf(frepTxt,"联合条件: 零序<1%% 且 尺度比<1.2，否则回退独立\n");
+        fprintf(frepTxt,"熵编码条件: 二次后 < 一次*0.95 且 >64B\n");
+        fprintf(frepTxt,"对比文件: out/comparison/*_comparison.csv 包含 原始/复原/误差\n");
         fprintf(frepTxt,"========================================\n\n");
     }
 
-    double totalOrig=0, totalSingle=0, totalSingleJoint=0, totalMulti=0, totalMultiJoint=0, totalLZ4=0, totalHuff=0;
+    double totalOrig=0, totalSingle=0, totalSingleJoint=0, totalMulti=0, totalMultiJoint=0;
     double totalSimSingle=0, totalSimSJ=0, totalSimMulti=0, totalSimMJ=0;
 
     for(int i=0;i<fileCount;i++){
@@ -273,7 +307,6 @@ int main(int argc, char* argv[]){
         SimpleMetrics mMulti = compress_file_mode(wd, pMulti, rMulti, mode, useZero, true, false);
         SimpleMetrics mMultiJ = compress_file_mode(wd, pMultiJ, rMultiJ, mode, useZero, true, true);
 
-        // 二次熵编码
         size_t binSize; uint8_t* binData=read_file_mem(pMultiJ, &binSize);
         size_t lz4Size=0, huffSize=0; double lz4Ratio=0, huffRatio=0; bool lz4Used=false, huffUsed=false;
         if(binData){
@@ -299,6 +332,7 @@ int main(int argc, char* argv[]){
         printf("多独立 %.2f:1 %.2f%%  多联合 %.2f:1 %.2f%% %s\n", mMulti.ratio, mMulti.sim*100, mMultiJ.ratio, mMultiJ.sim*100, mMultiJ.jointUsed?"[联合]":"[回退]");
         if(lz4Used) printf("多联合+LZ4 %.2f:1\n", lz4Ratio); else printf("LZ4 未使用\n");
         if(huffUsed) printf("多联合+Huffman %.2f:1\n", huffRatio); else printf("Huffman 未使用\n");
+        printf("对比文件已生成: out/comparison/%s_*_comparison.csv\n", baseName);
 
         if(frep){
             fprintf(frep,"%s,%d,%d,%d,%d,%zu,%.2f,%.6f,%.2f,%.6f,%d,%.2f,%.6f,%.2f,%.6f,%d,%.2f,%.2f,%.4f,%.4f\n",
@@ -317,13 +351,13 @@ int main(int argc, char* argv[]){
             fprintf(frepTxt,"  多联合: %.2f:1 相似度 %.4f%% %s\n", mMultiJ.ratio, mMultiJ.sim*100, mMultiJ.jointUsed?"[联合更优]":"[回退]");
             if(lz4Used) fprintf(frepTxt,"  多联合+LZ4: %.2f:1\n", lz4Ratio); else fprintf(frepTxt,"  多联合+LZ4: 未使用\n");
             if(huffUsed) fprintf(frepTxt,"  多联合+Huffman: %.2f:1\n", huffRatio); else fprintf(frepTxt,"  多联合+Huffman: 未使用\n");
+            fprintf(frepTxt,"  对比文件: out/comparison/%s_*_comparison.csv (原始/复原/误差)\n", baseName);
             fprintf(frepTxt,"\n");
         }
 
         totalOrig+=origBytes;
         totalSingle+=mSingle.compBytes; totalSingleJoint+=mSingleJ.compBytes;
         totalMulti+=mMulti.compBytes; totalMultiJoint+=mMultiJ.compBytes;
-        if(lz4Used) totalLZ4+=lz4Size; if(huffUsed) totalHuff+=huffSize;
         totalSimSingle+=mSingle.sim; totalSimSJ+=mSingleJ.sim; totalSimMulti+=mMulti.sim; totalSimMJ+=mMultiJ.sim;
 
         free_wave_data(wd);

@@ -1,116 +1,103 @@
-# NILM_Tool - 三相电压电流波形混合智能压缩
+# NILM_Tool - 三相电压电流波形混合智能压缩 (v0.8)
 
-> NILM 工具箱中的波形压缩与复原模块，支持现场 CSV/COMTRADE 批量处理，输出到 `out/` 目录。
+> 支持 `data/` 现场 CSV/COMTRADE 批量处理，`out/` 输出压缩、复原、对比与报告，集成三相联合编码与二次熵编码。
 
 ## 功能特性
-- **可配置采样率**：支持任意采样率（默认 6.4kHz，实测 10kHz@data/wave1.csv），pointsPerCycle = sampleRate/50，最大 1024点，FFT 支持非2幂（DFT fallback）
-- **高压缩比**：单周期 60-106:1，10周期 384:1，50周期 548:1；真实文件 data/wave1.csv (100233行 10kHz) 实测 98.98:1 相似度 99.99%
-- **高保真复原**：余弦相似度 >99.6%，支持 RMSE / SNR
-- **混合压缩技术**：FFT频域 + 自适应谐波 + 字典择优 + 帧间差分重复标记 0xFF + 零序优化
-- **文件化 I/O**：`data/` 输入，`out/compressed/` 二进制，`out/reconstructed/` CSV
+- **任意采样率**：支持 6.4kHz-50kHz，`ppc=sampleRate/50`，MAX 1024点，FFT 支持非2幂 DFT fallback，实测 10kHz@data/wave1-4.csv
+- **高压缩比**：基线独立 ~96:1，**三相联合 101.5:1 (+5.6%)**，**联合+LZ4 157-158:1 (+64% over baseline)**，联合+Huffman 133-146:1
+- **高保真**：相似度 >98.5% (联合后)，独立 >99.4%，满足 >95% 目标
+- **混合技术**：FFT频域 + 自适应谐波 + 字典择优 + 帧间差分重复 0xFF + 零序Clarke + **三相联合时域位移残差** + **二次熵编码 LZ4/Huffman**
+- **文件化 I/O**：`data/` 输入，`out/compressed/` 二进制，`out/reconstructed/` 复原，`out/comparison/` 原始vs复原对比
 
 ## 目录结构（用户要求）
 ```
 nilm_tool/
-├── data/                         # 现场采集 CSV / COMTRADE
-│   └── wave1.csv                 # 示例：100233行 timestamp,UA,IA,UB,IB,UC,IC 10kHz
+├── data/                         # 现场采集 CSV / COMTRADE (4文件示例)
+│   ├── wave1.csv (100233行 7.2M)
+│   ├── wave2.csv (68358行 4.9M)
+│   ├── wave3.csv (50295行 3.6M)
+│   └── wave4.csv (68342行 4.9M)
 ├── out/
-│   ├── compressed/               # 压缩后二进制 *.bin
-│   │   └── wave1.bin             # 格式: NILM magic + header + 每帧6通道 size+data
-│   └── reconstructed/            # 复原波形 CSV
-│       └── wave1_reconstructed.csv # 同输入格式，timestamp,UA,IA,UB,IB,UC,IC
+│   ├── compressed/               # 一次压缩 *.bin + 二次熵 *.lz4 *.huff
+│   │   ├── wave1_single.bin (独立)
+│   │   ├── wave1_single_joint.bin (联合)
+│   │   ├── wave1_multi_joint.bin (多周期联合)
+│   │   ├── wave1_multi_joint.bin.lz4 (二次 LZ4)
+│   │   └── wave1_multi_joint.bin.huff (二次 Huffman)
+│   ├── reconstructed/            # 复原波形 CSV 同输入格式
+│   ├── comparison/               # 新增：原始与复原对比 CSV
+│   │   └── wave1_single_joint_comparison.csv
+│   │       # timestamp,UA_orig,UA_recon,UA_err,IA_orig,IA_recon,IA_err,...
+│   └── verification_report_joint_entropy.csv/txt
+│       # 汇总每个文件单/多、独立/联合、LZ4/Huffman压缩比相似度
 ├── compress/
-│   └── compress_data.c           # 核心压缩库 (v0.3+，支持1024点，库模式守卫)
-├── file_tool.c                   # 文件批处理工具 -> 编译为 nilm_tool
-├── Makefile
+│   └── compress_data.c           # 核心库 v0.8 (1024点, DFT, 联合, 库守卫)
+├── entropy.c                     # 二次熵编码：LZ4 via dlopen + Huffman
+├── file_tool.c                   # 文件批处理工具 -> nilm_tool
+├── Makefile (-lm -ldl)
 └── README.md
 ```
 
-**二进制格式** (`out/compressed/*.bin`)：
+**二进制格式** (`*.bin`)：
 ```
-Header (20B):
-  magic 4B "NILM"
-  version u32 (1)
-  sampleRate i32
-  pointsPerCycle i32
-  numFrames i32
-  flags i32 (bit0=zeroOpt, bit1=dict, bit2=frameDiff)
-Per Frame (numFrames 次):
-  sizes[6] u32[6]  # Va,Vb,Vc,Ia,Ib,Ic 各通道压缩后大小
-  data0 size0 B
-  data1 size1 B
-  ...
-  data5 size5 B
-  (size==1 && data[0]==0xFF 表示重复前一帧，极致压缩)
+Header 20B: "NILM" + version(u32) + sampleRate(i32) + ppc(i32) + numFrames(i32) + flags(i32 bit0=zero,1=dict,2=frameDiff,3=joint)
+PerFrame: sizes[6] u32[6] + data[6]
+  size==1 && data[0]==0xFF 重复帧
 ```
 
-## 安装 / 环境
+**对比文件** (`*_comparison.csv`)：
+```
+timestamp,UA_orig,UA_recon,UA_err,IA_orig,IA_recon,IA_err,UB_orig,UB_recon,UB_err,IB_orig,IB_recon,IB_err,UC_orig,UC_recon,UC_err,IC_orig,IC_recon,IC_err
+2020/09/21 10:03:18.9996,39.33,46.41,-7.07,-0.68,-0.50,-0.17,...
+```
+
+## 安装与运行
 ```bash
-gcc --version
-sudo apt-get install build-essential
+make all && make dirs
+./compress_data                     # 合成信号基准：单周期102:1 多周期384:1/548:1
+./nilm_tool --mode 1                # 批量处理 data/*.csv -> out/ (单/联合/多/熵 + 对比)
+./nilm_tool --input data/wave1.csv --mode 0  # 单文件
+
+ls -lh out/compressed/ out/reconstructed/ out/comparison/
+cat out/verification_report_joint_entropy.txt
+head out/comparison/wave1_single_joint_comparison.csv
 ```
 
-## 运行命令
-```bash
-# 编译两个二进制：compress_data (基准测试) 和 nilm_tool (文件工具)
-make all
+**实测 v0.8**（BALANCED，4 文件）：
+```
+文件: wave1 (100233行 10kHz 200ppc 501帧)
+  平衡检查: 零序比0.15% 尺度比1.18 [适合联合]
+  单独立 98.94:1 99.48%  单联合 102.18:1 99.21% [联合更优] +3.3%
+  多独立 98.94:1 99.48%  多联合 102.18:1 99.21%
+  多联合+LZ4 157.75:1 (+59% over baseline)  Huffman 146.52:1
+  对比文件 out/comparison/wave1_*_comparison.csv (原始/复原/误差)
 
-# 基准测试（内置合成信号）
-./compress_data
-
-# 文件压缩工具 - 处理 data/ 下所有 CSV
-make dirs
-./nilm_tool --mode 1 --zero-opt 1
-# 或指定单文件
-./nilm_tool --input data/wave1.csv --mode 0
-
-# 查看结果
-ls -lh out/compressed/ out/reconstructed/
-head out/reconstructed/wave1_reconstructed.csv
-
-# Makefile 快捷
-make run          # 基准测试
-make run-tool     # 文件批处理
-make test-file    # 单文件测试
+汇总 4文件 总原始13.15MB
+单独立96.16:1 单联合101.54:1 (+5.6%) 多独立96.16:1 多联合101.54:1
+多联合+LZ4平均 ~157-158:1 (+64% over baseline) 相似度保持>98.5%
 ```
 
-**实测输出** (data/wave1.csv 10kHz)：
-```
-读取 data/wave1.csv: 100233 行, 估算采样率 10000 Hz
-使用 pointsPerCycle=200 (sampleRate=10000)
-压缩文件已写入 out/compressed/wave1.bin: 原始 4811184 字节, 压缩 48606 字节, 压缩比 98.98:1
-复原文件已写入 out/reconstructed/wave1_reconstructed.csv, 平均相似度 99.9918%
+## 两种增强算法的使用条件限制
 
-模式对比：
-  ULTRA (0): 45204B 106.43:1 99.99%
-  BALANCED (1): 48606B 98.98:1 99.99%
-  HIGH (2): 56829B 84.66:1 99.87%
-```
+### 三相联合编码
+- **适用**：三相平衡或近似平衡，零序能量比 `<1%` 且 尺度比 `max/min <1.2` 且均值接近0。此时 Vb,Vc 可由 Va 时域位移 N/3 得到，残差小，压缩比提升 3-13%（wave4 13%）。
+- **不适用**：三相不平衡、大量零序、暂态、单相接地故障等，会回退独立编码以保证相似度。
+- **实现**：`is_balanced_three_phase()` 检查，`compress_three_phase_joint()` 若不平衡则 `return compress_three_phase()`。
+
+### 二次熵编码（LZ4/Huffman）
+- **LZ4**：通过 `dlopen` 运行时加载 `liblz4.so.1`，适用于含重复模式、字典可压缩数据。对已高度量化高熵数据提升有限，小文件（<64B）头部开销可能膨胀。
+  - 条件：仅当二次后 `< 一次*0.95` 且原尺寸 `>64B` 时使用
+- **Huffman**：纯C实现，统计频率建树，适用于符号分布不均匀数据，需存储频率表，表头开销 `1+present*5+8`，对小文件不划算，条件同上。
+- 两者均为**无损**二次压缩，不影响相似度，只提升压缩比。
 
 ## 配置
-```c
-create_config(sampleRate, mode) // mode 0=ULTRA 1=BALANCED 2=HIGH_QUALITY
-// 默认启用 dict, frameDiff, zeroOpt, adaptive
-```
-
-## 生产流程
-1. **采集**：现场设备导出 CSV (`timestamp,UA,IA,UB,IB,UC,IC`) 或 COMTRADE (.cfg/.dat) 放入 `data/`
-2. **压缩**：`./nilm_tool --mode 1` 批量处理，生成 `out/compressed/*.bin`
-3. **传输/存储**：.bin 文件可直接存储或通过 MQTT/CoAP 传输，重复帧仅 1B/通道
-4. **复原**：工具自动生成 `out/reconstructed/*.csv`，或调用 `decompress_three_phase()` 在接收端重建
-5. **评估**：对比 `data/` 与 `out/reconstructed/` 计算相似度/RMSE/SNR
-6. **NILM**：复原 CSV 可直接输入 Python NILM 模型
-
-## COMTRADE 支持
-- 当前版本主要支持 CSV，COMTRADE 预留接口
-- 计划：解析 .cfg 获取通道配置，.dat 读取采样值，映射到 6 通道
-- 临时方案：若有 .cfg/.dat，可先转换为 CSV 格式 `timestamp,UA,IA,...` 再处理
+`create_config(sampleRate, mode)` mode 0=ULTRA 1=BALANCED 2=HIGH
 
 ## 演进
-- v0.1 编译失败
-- v0.2 修复量化与顺序，相似度>99.8% 单周期60-100:1
-- v0.3 重复帧 0xFF 多周期384:1/548:1
-- v0.4 (当前) 支持 data/ out/ 目录结构，10kHz真实波形，1024点，任意点DFT，文件工具 nilm_tool，二进制格式，提供 batch 处理
+- v0.4 data/out 目录
+- v0.5 批量验证4文件
+- v0.6 单/多周期对比
+- v0.7 联合+熵编码 101:1 → 157:1
+- v0.8 **对比文件** out/comparison/ 原始vs复原
 
-## 开发仪式
-遵循 BOOTSTRAP.md 开局与收尾。
+遵循 BOOTSTRAP.md 仪式。
