@@ -800,6 +800,188 @@ void decompress_three_phase_joint(HybridCompressor* comp, const CompressedData* 
     if(pIc_res) free(pIc_res);
 }
 
+/* ============================================================
+ * 9. 以周波为单位的压缩与复原 - 单周波与多周波算法
+ * ============================================================ */
+
+// 单周波：每个周波独立压缩，不依赖历史
+CompressedData compress_single_cycle(HybridCompressor* comp,
+                                    const double* Va, const double* Vb, const double* Vc,
+                                    const double* Ia, const double* Ib, const double* Ic,
+                                    int n){
+    // 单周期模式：禁用帧间差分，临时保存并恢复 hasPrev
+    bool savedHasPrev[6];
+    for(int i=0;i<6;i++) savedHasPrev[i]=comp->hasPrev[i];
+    for(int i=0;i<6;i++) comp->hasPrev[i]=false; // 强制独立
+    CompressedData cd = compress_three_phase(comp, Va,Vb,Vc,Ia,Ib,Ic,n);
+    // 恢复历史标志，但不保留本次帧作为历史（单周期独立）
+    for(int i=0;i<6;i++) comp->hasPrev[i]=savedHasPrev[i];
+    return cd;
+}
+
+void decompress_single_cycle(HybridCompressor* comp, const CompressedData* data,
+                            double* Va, double* Vb, double* Vc,
+                            double* Ia, double* Ib, double* Ic,
+                            int* outN){
+    bool savedHasPrev[6];
+    for(int i=0;i<6;i++) savedHasPrev[i]=comp->hasPrev[i];
+    for(int i=0;i<6;i++) comp->hasPrev[i]=false;
+    decompress_three_phase(comp, data, Va,Vb,Vc,Ia,Ib,Ic, outN);
+    for(int i=0;i<6;i++) comp->hasPrev[i]=savedHasPrev[i];
+}
+
+// 单周波联合
+CompressedData compress_single_cycle_joint(HybridCompressor* comp,
+                                    const double* Va, const double* Vb, const double* Vc,
+                                    const double* Ia, const double* Ib, const double* Ic,
+                                    int n, bool* usedJoint){
+    bool savedHasPrev[6];
+    for(int i=0;i<6;i++) savedHasPrev[i]=comp->hasPrev[i];
+    for(int i=0;i<6;i++) comp->hasPrev[i]=false;
+    CompressedData cd = compress_three_phase_joint(comp, Va,Vb,Vc,Ia,Ib,Ic,n, usedJoint);
+    for(int i=0;i<6;i++) comp->hasPrev[i]=savedHasPrev[i];
+    return cd;
+}
+
+void decompress_single_cycle_joint(HybridCompressor* comp, const CompressedData* data,
+                            double* Va, double* Vb, double* Vc,
+                            double* Ia, double* Ib, double* Ic,
+                            int* outN){
+    bool savedHasPrev[6];
+    for(int i=0;i<6;i++) savedHasPrev[i]=comp->hasPrev[i];
+    for(int i=0;i<6;i++) comp->hasPrev[i]=false;
+    decompress_three_phase_joint(comp, data, Va,Vb,Vc,Ia,Ib,Ic, outN);
+    for(int i=0;i<6;i++) comp->hasPrev[i]=savedHasPrev[i];
+}
+
+// 多周波批量结构
+typedef struct {
+    CompressedData* frames; // 帧数组
+    int numFrames;
+    size_t totalSize; // 含每帧头
+    int pointsPerCycle;
+    int sampleRate;
+    bool isJoint; // 是否使用联合
+    bool isMulti; // 是否使用多周期差分
+} MultiCycleCompressedData;
+
+void free_multi_cycle_data(MultiCycleCompressedData* mc){
+    if(!mc) return;
+    if(mc->frames){
+        for(int i=0;i<mc->numFrames;i++) free_compressed_data(&mc->frames[i]);
+        free(mc->frames);
+        mc->frames=NULL;
+    }
+    mc->numFrames=0; mc->totalSize=0;
+}
+
+// 多周波压缩：以周波为单位，持续使用历史（帧间差分+重复标记）
+// useJoint: 是否尝试三相联合
+MultiCycleCompressedData compress_multi_cycle(HybridCompressor* comp,
+                                    const double* Va, const double* Vb, const double* Vc,
+                                    const double* Ia, const double* Ib, const double* Ic,
+                                    int totalN, bool useJoint){
+    MultiCycleCompressedData mc;
+    memset(&mc,0,sizeof(mc));
+    mc.pointsPerCycle = comp->N;
+    mc.sampleRate = comp->config.sampleRate;
+    mc.isJoint = useJoint;
+    mc.isMulti = comp->config.enableFrameDiff;
+    int ppc = comp->N;
+    int numFrames = totalN / ppc;
+    mc.numFrames = numFrames;
+    mc.frames = (CompressedData*)calloc(numFrames, sizeof(CompressedData));
+    if(!mc.frames){ mc.numFrames=0; return mc; }
+
+    size_t total=0;
+    for(int fr=0; fr<numFrames; fr++){
+        int off=fr*ppc;
+        bool usedJoint=false;
+        CompressedData cd;
+        if(useJoint){
+            cd = compress_three_phase_joint(comp, Va+off, Vb+off, Vc+off, Ia+off, Ib+off, Ic+off, ppc, &usedJoint);
+        }else{
+            cd = compress_three_phase(comp, Va+off, Vb+off, Vc+off, Ia+off, Ib+off, Ic+off, ppc);
+        }
+        mc.frames[fr]=cd;
+        total+=cd.totalSize + 24; // 每帧6x4字节size头
+    }
+    mc.totalSize = total + 20; // 文件头
+    return mc;
+}
+
+// 多周波解压：批量
+int decompress_multi_cycle(HybridCompressor* comp, const MultiCycleCompressedData* mc,
+                            double* Va, double* Vb, double* Vc,
+                            double* Ia, double* Ib, double* Ic){
+    int ppc = mc->pointsPerCycle;
+    for(int fr=0; fr<mc->numFrames; fr++){
+        int off=fr*ppc;
+        int outN;
+        if(mc->isJoint){
+            decompress_three_phase_joint(comp, &mc->frames[fr], Va+off, Vb+off, Vc+off, Ia+off, Ib+off, Ic+off, &outN);
+        }else{
+            decompress_three_phase(comp, &mc->frames[fr], Va+off, Vb+off, Vc+off, Ia+off, Ib+off, Ic+off, &outN);
+        }
+    }
+    return mc->numFrames * ppc;
+}
+
+// 多周波评估：计算平均相似度等
+EvaluationResult evaluate_multi_cycle(const MultiCycleCompressedData* mc,
+                                      const double* Va, const double* Vb, const double* Vc,
+                                      const double* Ia, const double* Ib, const double* Ic,
+                                      int totalN, const CompressionConfig* config){
+    EvaluationResult result;
+    memset(&result,0,sizeof(result));
+    int ppc = mc->pointsPerCycle;
+    int numFrames = mc->numFrames;
+    // 分配重构缓冲区
+    double *Va_r = (double*)malloc(totalN*sizeof(double));
+    double *Vb_r = (double*)malloc(totalN*sizeof(double));
+    double *Vc_r = (double*)malloc(totalN*sizeof(double));
+    double *Ia_r = (double*)malloc(totalN*sizeof(double));
+    double *Ib_r = (double*)malloc(totalN*sizeof(double));
+    double *Ic_r = (double*)malloc(totalN*sizeof(double));
+    if(!Va_r||!Vb_r||!Vc_r||!Ia_r||!Ib_r||!Ic_r){
+        if(Va_r) free(Va_r); if(Vb_r) free(Vb_r); if(Vc_r) free(Vc_r);
+        if(Ia_r) free(Ia_r); if(Ib_r) free(Ib_r); if(Ic_r) free(Ic_r);
+        return result;
+    }
+    HybridCompressor comp;
+    compressor_init(&comp, config);
+    // 解压所有帧
+    for(int fr=0; fr<numFrames; fr++){
+        int off=fr*ppc;
+        int outN;
+        if(mc->isJoint){
+            decompress_three_phase_joint(&comp, &mc->frames[fr], Va_r+off, Vb_r+off, Vc_r+off, Ia_r+off, Ib_r+off, Ic_r+off, &outN);
+        }else{
+            decompress_three_phase(&comp, &mc->frames[fr], Va_r+off, Vb_r+off, Vc_r+off, Ia_r+off, Ib_r+off, Ic_r+off, &outN);
+        }
+    }
+    int validN = numFrames*ppc;
+    if(validN>totalN) validN=totalN;
+    result.similarities[0]=calculate_similarity(Va, Va_r, validN);
+    result.similarities[1]=calculate_similarity(Vb, Vb_r, validN);
+    result.similarities[2]=calculate_similarity(Vc, Vc_r, validN);
+    result.similarities[3]=calculate_similarity(Ia, Ia_r, validN);
+    result.similarities[4]=calculate_similarity(Ib, Ib_r, validN);
+    result.similarities[5]=calculate_similarity(Ic, Ic_r, validN);
+    result.avgSimilarity=0; for(int i=0;i<6;i++) result.avgSimilarity+=result.similarities[i]; result.avgSimilarity/=6;
+    result.avgRMSE=(calculate_rmse(Va,Va_r,validN)+calculate_rmse(Vb,Vb_r,validN)+calculate_rmse(Vc,Vc_r,validN)+calculate_rmse(Ia,Ia_r,validN)+calculate_rmse(Ib,Ib_r,validN)+calculate_rmse(Ic,Ic_r,validN))/6;
+    result.avgSNR=(calculate_snr(Va,Va_r,validN)+calculate_snr(Vb,Vb_r,validN)+calculate_snr(Vc,Vc_r,validN)+calculate_snr(Ia,Ia_r,validN)+calculate_snr(Ib,Ib_r,validN)+calculate_snr(Ic,Ic_r,validN))/6;
+    result.originalSize = 6*validN*sizeof(double);
+    result.compressedSize = mc->totalSize;
+    result.compressionRatio = (double)result.originalSize / result.compressedSize;
+    result.passed = (result.avgSimilarity >= config->targetSimilarity);
+    free(Va_r); free(Vb_r); free(Vc_r); free(Ia_r); free(Ib_r); free(Ic_r);
+    return result;
+}
+
+
+
+
 
 
 CompressionConfig create_config(int sampleRate,int mode){
